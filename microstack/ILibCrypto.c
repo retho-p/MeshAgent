@@ -34,6 +34,9 @@ limitations under the License.
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include <openssl/hmac.h>
+#ifdef _POSIX
+#include <sys/stat.h>
+#endif
 #else
 #ifdef WIN32
 void BCRYPT_INIT(BCRYPT_CTX* ctx, void* alg)
@@ -61,6 +64,7 @@ void BCRYPT_FINAL(char *h, BCRYPT_CTX* ctx)
 #include "microstack/nossl/sha1.h"
 #include "microstack/nossl/sha.h"
 #include <time.h>
+#include <sys/stat.h>
 #endif
 #endif
 
@@ -516,6 +520,71 @@ void __fastcall util_openssl_uninit()
 #ifndef OLDSSL
 	OPENSSL_cleanup();
 #endif
+}
+
+int __fastcall util_load_system_certs(SSL_CTX *ctx) 
+{
+	#ifdef WIN32
+        X509_STORE *xs = SSL_CTX_get_cert_store(ctx);
+	    HCERTSTORE s = CertOpenSystemStoreW(0, L"ROOT");
+        BIO *in;
+        X509 *x;
+	    const CERT_CONTEXT *wctx = NULL;
+        for (;;) {
+            wctx = CertEnumCertificatesInStore(s, wctx);
+            if (!wctx)
+                break;
+            in = BIO_new_mem_buf(wctx->pbCertEncoded, wctx->cbCertEncoded);
+            x = d2i_X509_bio(in, NULL);
+            X509_STORE_add_cert(xs, x);
+            X509_free(x);
+            BIO_free(in);
+        }
+
+        CertFreeCertificateContext(wctx);
+        CertCloseStore(s, 0);
+	#else
+	    const char *cert_dir = X509_get_default_cert_dir();
+	    struct stat s;
+		int err = stat(cert_dir, &s);
+		// The system we are on uses a different SSL dir than our statically included openssl. Try to grab it from the locally installed openssl distribution.
+		if (err == -1) {
+    		char buf[1024] = {0};
+    		char dest[1024] = {0};
+
+    		FILE *output;
+			// Running "openssl version -d" should give us the directory of the locally installed openssl. We can then use that directory to load the certs from that distribution.
+			// However, this could be a security risk as we are running "openssl" as root.
+    		if ((output = popen("openssl version -d", "r")) == NULL) {
+		        return -1;
+		    }
+		    char *tokenized;
+		    while (fgets(buf, 1024, output) != NULL) {
+		        tokenized = strtok(buf, "\"");
+		        while(tokenized != NULL) {
+		        	if (tokenized[0] == '/') {
+		        		strcat_s(dest, sizeof(dest), tokenized);
+		        		strcat_s(dest, sizeof(dest), "/certs");
+		        		// Some systems use a /certs dir, some don't. Test for both.
+		        		err = stat(dest, &s);
+		        		if (err) {
+		        			SSL_CTX_load_verify_locations(ctx, NULL, tokenized);
+		        		} else {
+		        			SSL_CTX_load_verify_locations(ctx, NULL, dest);
+		        		}
+		        		break;
+		        	}
+		        	tokenized = strtok(NULL, "\"");
+		        }
+		    }
+		    if (pclose(output)) {
+		        return -1;
+		    }
+		} else {
+			SSL_CTX_set_default_verify_paths(ctx);
+		}
+	#endif
+	return 0;
 }
 
 // Add extension using V3 code: we can set the config file as NULL because we wont reference any other sections.

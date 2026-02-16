@@ -1036,6 +1036,7 @@ void* ILibMemory_SmartReAllocate(void *ptr, size_t len)
 		size_t originalRawSize = ILibMemory_Init_Size(ILibMemory_Size(ptr), ILibMemory_ExtraSize(ptr));
 		size_t originalSize = ILibMemory_Size(ptr);
 		size_t originalExtraSize = ILibMemory_ExtraSize(ptr);
+		if (originalExtraSize) { len = (len + sizeof(void *) - 1) & ~(sizeof(void *) - 1); }
 		size_t newRawSize = ILibMemory_Init_Size(len, originalExtraSize);
 
 		if (newRawSize < originalRawSize && originalExtraSize > 0)
@@ -1095,6 +1096,7 @@ void* ILibMemory_SmartAllocateEx_ResizeExtra(void *ptr, size_t newExtraSize)
 void* ILibMemory_Init(void *ptr, size_t primarySize, size_t extraSize, ILibMemory_Types memType)
 {
 	if (ptr == NULL) { ILIBCRITICALEXIT(254); }
+	if (extraSize) primarySize = (primarySize + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
 	memset(ptr, 0, primarySize + extraSize + sizeof(ILibMemory_Header) + (extraSize > 0 ? sizeof(ILibMemory_Header) : 0));
 
 	void *primary = ILibMemory_FromRaw(ptr);
@@ -9405,14 +9407,14 @@ char* ILibString_Cat_s(char *destination, size_t destinationSize, char *source)
 {
 	size_t sourceLen = strnlen_s(source, destinationSize);
 	size_t i;
-	size_t *x = NULL;
+	size_t x = destinationSize;
 	for (i = 0; i < destinationSize - 1; ++i)
 	{
-		if (destination[i] == 0) { *x = i; break; }
+		if (destination[i] == 0) { x = i; break; }
 	}
-	if (x == NULL || ((*x + sourceLen + 1 )> destinationSize)) { ILIBCRITICALEXIT(254); }
-	memcpy_s(destination + *x, destinationSize - *x, source, sourceLen);
-	destination[*x + sourceLen] = 0;
+	if (((x + sourceLen + 1 )> destinationSize)) { ILIBCRITICALEXIT(254); }
+	memcpy_s(destination + x, destinationSize - x, source, sourceLen);
+	destination[x + sourceLen] = 0;
 	return(destination);
 }
 #ifndef WIN32
