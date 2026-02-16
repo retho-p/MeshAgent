@@ -56,6 +56,10 @@ typedef struct DXGI_CaptureContext
 DXGI_CaptureContext g_dxgiCtx;
 PFN_D3D11_CREATE_DEVICE g_D3D11CreateDevice = NULL;
 
+/* Persistent desktop buffer for DXGI capture — avoids malloc/free (~8 MB) per frame */
+static void *g_dxgiDesktopBuf = NULL;
+static long long g_dxgiDesktopBufSize = 0;
+
 void kvm_dxgi_cleanup();
 int kvm_dxgi_init();
 int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMove);
@@ -1260,7 +1264,9 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 			KVMDEBUG("kvm_server_mainloop / loop2", (int)GetCurrentThreadId());
 
-			if (desktop)
+			/* Only free the desktop buffer if it was allocated by GDI capture.
+			   The DXGI path uses a persistent buffer that is reused across frames. */
+			if (desktop && desktop != g_dxgiDesktopBuf)
 				free(desktop);
 			desktop = NULL;
 			desktopsize = 0;
@@ -1573,6 +1579,10 @@ void kvm_dxgi_cleanup()
 	if (g_dxgiCtx.hDXGI) { FreeLibrary(g_dxgiCtx.hDXGI); g_dxgiCtx.hDXGI = NULL; }
 	g_dxgiCtx.initialized = 0;
 	g_D3D11CreateDevice = NULL;
+
+	/* Release the persistent desktop buffer when DXGI is torn down */
+	if (g_dxgiDesktopBuf) { free(g_dxgiDesktopBuf); g_dxgiDesktopBuf = NULL; }
+	g_dxgiDesktopBufSize = 0;
 }
 
 int kvm_dxgi_load_libraries()
@@ -1734,7 +1744,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 						int endCol = (rects[i].right + TILE_WIDTH - 1) / TILE_WIDTH;
 						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
 						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_TODO; } }
+						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
 					}
 				}
 
@@ -1753,7 +1763,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 						int endCol = (moveRects[i].DestinationRect.right + TILE_WIDTH - 1) / TILE_WIDTH;
 						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
 						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_TODO; } }
+						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
 
 						// Mark source area tiles (SourcePoint + same size as destination)
 						int moveW = moveRects[i].DestinationRect.right - moveRects[i].DestinationRect.left;
@@ -1766,7 +1776,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 						if (startCol < 0) startCol = 0;
 						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
 						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_TODO; } }
+						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
 					}
 				}
 
@@ -1805,12 +1815,25 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 
 	*bufferSize = (long long)adjWidth * (long long)adjHeight * 4;
 	PIXEL_SIZE = 4;
-	if ((*buffer = malloc((size_t)*bufferSize)) == NULL)
+	/* Reuse a persistent buffer across frames to avoid malloc/free (~8 MB) per capture.
+	   Only reallocate when the required size changes (resolution change). */
+	if (g_dxgiDesktopBufSize != *bufferSize)
 	{
-		g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
-		return 1;
+		free(g_dxgiDesktopBuf);
+		g_dxgiDesktopBuf = malloc((size_t)*bufferSize);
+		if (g_dxgiDesktopBuf == NULL)
+		{
+			g_dxgiDesktopBufSize = 0;
+			g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
+			return 1;
+		}
+		/* Zero only on first allocation — the flipped row copy below overwrites
+		   all visible pixels; only tile-alignment padding remains untouched
+		   and stale padding data is harmless for CRC and JPEG encoding. */
+		memset(g_dxgiDesktopBuf, 0, (size_t)*bufferSize);
+		g_dxgiDesktopBufSize = *bufferSize;
 	}
-	memset(*buffer, 0, (size_t)*bufferSize);
+	*buffer = g_dxgiDesktopBuf;
 
 	// DXGI produces top-down pixel data, but tile.cpp expects bottom-up (GDI DIB layout).
 	// Copy lines in reverse order and use the aligned destination pitch.
