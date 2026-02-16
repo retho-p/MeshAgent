@@ -334,7 +334,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 			CRC = tile_crc(r_x, y, desktop, TILE_WIDTH, TILE_HEIGHT);
 		}
 
-		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT) // If the tile has changed, increment the capturewidth.
+		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT || tileInfo[row][rightcol].flags == (char)TILE_DXGI_DIRTY) // If the tile has changed, increment the capturewidth.
 		{
 			tileInfo[row][rightcol].crc = CRC; 
 			// Here we check whether the size of the coalesced bitmap is greater than the threshold (65500)
@@ -377,7 +377,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 				CRC = tile_crc(r_x, r_y, desktop, TILE_WIDTH, TILE_HEIGHT);
 			}
 
-			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT)
+			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT || tileInfo[botrow][rcol].flags == (char)TILE_DXGI_DIRTY)
 			{
 				tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
 				tileInfo[botrow][rcol].crc = CRC;
