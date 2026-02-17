@@ -1274,21 +1274,44 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
 
-		// We can't go full speed here, we need to slow this down.
-		height = FRAME_RATE_TIMER;
-		while (!g_shutdown && height > 0)
+		/* Frame pacing: GDI needs a fixed delay because it always captures the full screen.
+		   DXGI can go faster because AcquireNextFrame(0) is near-free when idle. */
+		if (g_dxgiCtx.initialized)
 		{
-			if (height > 50)
+			if (captureResult == 2)
 			{
-				height -= 50;
-				Sleep(50);
+				/* DXGI reported no changes — short poll to catch the next frame quickly.
+				   AcquireNextFrame(0) returns instantly when idle, so this is low-cost. */
+				Sleep(10);
 			}
 			else
 			{
-				Sleep(height);
-				height = 0;
+				/* DXGI captured and encoded a frame — tile encoding already consumed time,
+				   so skip the extra sleep. The existing g_pause mechanism handles backpressure
+				   if we send faster than the network can deliver. */
+				Sleep(1);
 			}
 			SleepEx(0, TRUE);
+		}
+		else
+		{
+			/* GDI mode: keep the original fixed-rate throttle.
+			   GDI always captures the full screen, so we need to slow it down. */
+			height = FRAME_RATE_TIMER;
+			while (!g_shutdown && height > 0)
+			{
+				if (height > 50)
+				{
+					height -= 50;
+					Sleep(50);
+				}
+				else
+				{
+					Sleep(height);
+					height = 0;
+				}
+				SleepEx(0, TRUE);
+			}
 		}
 	}
 
