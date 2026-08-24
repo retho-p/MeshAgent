@@ -60,6 +60,10 @@ PFN_D3D11_CREATE_DEVICE g_D3D11CreateDevice = NULL;
 static void *g_dxgiDesktopBuf = NULL;
 static long long g_dxgiDesktopBufSize = 0;
 
+/* Desktop changes can be detected by either the input or capture thread.
+   Only the capture thread may consume this request and touch DXGI resources. */
+static volatile LONG g_desktopSwitchPending = 0;
+
 void kvm_dxgi_cleanup();
 int kvm_dxgi_init();
 int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMove);
@@ -355,10 +359,12 @@ void kvm_send_display_list(ILibKVM_WriteHandler writeHandler, void *reserved)
 	}
 }
 
-int kvm_server_currentDesktopname = 0;
+volatile LONG kvm_server_currentDesktopname = 0;
 void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *reserved)
 {
 	int x, y, w, h;
+	LONG desktopName;
+	LONG previousDesktopName;
 	HDESK desktop;
 	HDESK desktop2;
 	char name[64];
@@ -402,29 +408,21 @@ void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Current desktop = %s", name);
 
 		// KVMDEBUG(name, 0);
-		if (kvm_server_currentDesktopname == 0)
+		memcpy(&desktopName, name, sizeof(desktopName));
+		previousDesktopName = InterlockedExchange(&kvm_server_currentDesktopname, desktopName);
+		if (previousDesktopName == 0)
 		{
 			// This is the first time we come here.
-			kvm_server_currentDesktopname = ((int *)name)[0];
 			ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Initial desktop captured: %s", name);
 		}
-		else
+		else if (previousDesktopName != desktopName)
 		{
 			// If the desktop name has changed, switch to it instead of shutting down
-			if (kvm_server_currentDesktopname != ((int *)name)[0])
-			{
-				KVMDEBUG("DESKTOP NAME CHANGE DETECTED, switching session", 0);
-				ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Desktop switched to: %s (UAC/Lock screen detected)", name);
-				kvm_dxgi_cleanup(); // Release DXGI resources bound to the old desktop
-				kvm_server_currentDesktopname = ((int *)name)[0];
-				// Force screen refresh after desktop switch
-				if (checkres != 0)
-				{
-					kvm_server_SetResolution(writeHandler, reserved);
-				}
-				// Re-initialize DXGI for the new desktop immediately
-				kvm_dxgi_init();
-			}
+			KVMDEBUG("DESKTOP NAME CHANGE DETECTED, switching session", 0);
+			ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Desktop switched to: %s (UAC/Lock screen detected)", name);
+			/* Do not touch DXGI here: this function also runs on the input thread.
+			   The capture thread will reset DXGI and force a screen refresh. */
+			InterlockedExchange(&g_desktopSwitchPending, 1);
 		}
 	}
 	else
@@ -997,6 +995,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 
 	KVMDEBUG("kvm_server_mainloop / start2", (int)GetCurrentThreadId());
+	InterlockedExchange(&g_desktopSwitchPending, 0);
 
 	if (!initialize_gdiplus())
 	{
@@ -1075,6 +1074,14 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			}
 		}
 		CheckDesktopSwitch(1, writeHandler, reserved);
+		if (InterlockedExchange(&g_desktopSwitchPending, 0) != 0)
+		{
+			/* The capture thread owns all DXGI resources. Recreate them only here,
+			   after this thread has switched to the new input desktop. */
+			kvm_dxgi_cleanup();
+			kvm_server_SetResolution(writeHandler, reserved);
+			kvm_dxgi_init();
+		}
 		if (g_shutdown)
 			break;
 
