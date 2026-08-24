@@ -1694,8 +1694,18 @@ int kvm_dxgi_init()
 	// Create staging texture
 	D3D11_TEXTURE2D_DESC stagingDesc;
 	ZeroMemory(&stagingDesc, sizeof(stagingDesc));
-	stagingDesc.Width = g_dxgiCtx.desc.ModeDesc.Width;
-	stagingDesc.Height = g_dxgiCtx.desc.ModeDesc.Height;
+	/* AcquireNextFrame returns the underlying unrotated surface. The logical
+	   ModeDesc dimensions are therefore swapped for portrait orientations. */
+	if (g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE90 || g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE270)
+	{
+		stagingDesc.Width = g_dxgiCtx.desc.ModeDesc.Height;
+		stagingDesc.Height = g_dxgiCtx.desc.ModeDesc.Width;
+	}
+	else
+	{
+		stagingDesc.Width = g_dxgiCtx.desc.ModeDesc.Width;
+		stagingDesc.Height = g_dxgiCtx.desc.ModeDesc.Height;
+	}
 	stagingDesc.MipLevels = 1;
 	stagingDesc.ArraySize = 1;
 	stagingDesc.Format = g_dxgiCtx.desc.ModeDesc.Format;
@@ -1749,11 +1759,33 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	desktopResource->lpVtbl->Release(desktopResource);
 	if (FAILED(hr)) { g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication); return 1; }
 
+	/* Validate the driver-provided surface before CopyResource. Rotated output
+	   surfaces must use the unrotated dimensions described by Microsoft. */
+	D3D11_TEXTURE2D_DESC desktopDesc;
+	desktopImage->lpVtbl->GetDesc(desktopImage, &desktopDesc);
+	UINT expectedSurfaceWidth = g_dxgiCtx.desc.ModeDesc.Width;
+	UINT expectedSurfaceHeight = g_dxgiCtx.desc.ModeDesc.Height;
+	if (g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE90 || g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE270)
+	{
+		expectedSurfaceWidth = g_dxgiCtx.desc.ModeDesc.Height;
+		expectedSurfaceHeight = g_dxgiCtx.desc.ModeDesc.Width;
+	}
+	if (desktopDesc.Width != expectedSurfaceWidth || desktopDesc.Height != expectedSurfaceHeight || desktopDesc.Format != g_dxgiCtx.desc.ModeDesc.Format)
+	{
+		desktopImage->lpVtbl->Release(desktopImage);
+		g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication);
+		kvm_dxgi_cleanup();
+		return 1;
+	}
+
 	g_dxgiCtx.context->lpVtbl->CopyResource(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, (ID3D11Resource*)desktopImage);
 	desktopImage->lpVtbl->Release(desktopImage);
 
-	// Process frame metadata while the frame is still acquired (required by DXGI API)
-	if (frameInfo.LastPresentTime.QuadPart != 0)
+	// Process frame metadata while the frame is still acquired (required by DXGI API).
+	// Rotated metadata uses the unrotated surface coordinate space. Keep rotated
+	// frames on the safe full-frame CRC path instead of risking stale tiles.
+	if (frameInfo.LastPresentTime.QuadPart != 0 &&
+		(g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED || g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_IDENTITY))
 	{
 		for (row = 0; row < TILE_HEIGHT_COUNT; row++) { for (col = 0; col < TILE_WIDTH_COUNT; col++) { tileInfo[row][col].flags = (char)TILE_DONT_SEND; } }
 
@@ -1841,8 +1873,15 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	int extraH = adjHeight % TILE_HEIGHT;
 	if (extraH != 0) adjHeight += TILE_HEIGHT - extraH;
 
-	UINT srcWidth = g_dxgiCtx.desc.ModeDesc.Width;
-	UINT srcHeight = g_dxgiCtx.desc.ModeDesc.Height;
+	UINT dstWidth = g_dxgiCtx.desc.ModeDesc.Width;
+	UINT dstHeight = g_dxgiCtx.desc.ModeDesc.Height;
+	UINT srcWidth = dstWidth;
+	UINT srcHeight = dstHeight;
+	if (g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE90 || g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_ROTATE270)
+	{
+		srcWidth = dstHeight;
+		srcHeight = dstWidth;
+	}
 	UINT dstRowPitch = adjWidth * 4;
 
 	*bufferSize = (long long)adjWidth * (long long)adjHeight * 4;
@@ -1867,18 +1906,34 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	}
 	*buffer = g_dxgiDesktopBuf;
 
-	// DXGI produces top-down pixel data, but tile.cpp expects bottom-up (GDI DIB layout).
-	// Copy lines in reverse order and use the aligned destination pitch.
-	BYTE* sptr = (BYTE*)mappedResource.pData;
+	// DXGI produces a top-down, physically unrotated surface. Convert it to the
+	// logical display orientation while preserving tile.cpp's bottom-up DIB.
+	UINT x, y;
+	UINT srcPitchPixels = mappedResource.RowPitch / 4;
+	UINT* srcPixels = (UINT*)mappedResource.pData;
 	BYTE* dstBase = (BYTE*)*buffer;
-	UINT srcRowBytes = srcWidth * 4;
-	for (i = 0; i < (int)srcHeight; i++)
+	for (y = 0; y < dstHeight; y++)
 	{
 		// Keep the visible desktop at the top of the aligned bottom-up DIB.
 		// Any tile-alignment padding therefore remains below the desktop image.
-		int dstRow = adjHeight - 1 - i;
-		memcpy(dstBase + (dstRow * dstRowPitch), sptr, srcRowBytes);
-		sptr += mappedResource.RowPitch;
+		UINT* dstPixels = (UINT*)(dstBase + ((adjHeight - 1 - y) * dstRowPitch));
+		switch (g_dxgiCtx.desc.Rotation)
+		{
+			case DXGI_MODE_ROTATION_ROTATE90:
+				for (x = 0; x < dstWidth; x++) dstPixels[x] = srcPixels[((srcHeight - 1 - x) * srcPitchPixels) + y];
+				break;
+			case DXGI_MODE_ROTATION_ROTATE180:
+				for (x = 0; x < dstWidth; x++) dstPixels[x] = srcPixels[((srcHeight - 1 - y) * srcPitchPixels) + (srcWidth - 1 - x)];
+				break;
+			case DXGI_MODE_ROTATION_ROTATE270:
+				for (x = 0; x < dstWidth; x++) dstPixels[x] = srcPixels[(x * srcPitchPixels) + (srcWidth - 1 - y)];
+				break;
+			case DXGI_MODE_ROTATION_UNSPECIFIED:
+			case DXGI_MODE_ROTATION_IDENTITY:
+			default:
+				memcpy(dstPixels, srcPixels + (y * srcPitchPixels), dstWidth * 4);
+				break;
+		}
 	}
 
 	g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
