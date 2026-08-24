@@ -60,10 +60,6 @@ PFN_D3D11_CREATE_DEVICE g_D3D11CreateDevice = NULL;
 static void *g_dxgiDesktopBuf = NULL;
 static long long g_dxgiDesktopBufSize = 0;
 
-/* Desktop changes can be detected by either the input or capture thread.
-   Only the capture thread may consume this request and touch DXGI resources. */
-static volatile LONG g_desktopSwitchPending = 0;
-
 void kvm_dxgi_cleanup();
 int kvm_dxgi_init();
 int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMove);
@@ -360,10 +356,10 @@ void kvm_send_display_list(ILibKVM_WriteHandler writeHandler, void *reserved)
 }
 
 volatile LONG kvm_server_currentDesktopname = 0;
-void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *reserved)
+LONG CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *reserved)
 {
 	int x, y, w, h;
-	LONG desktopName;
+	LONG desktopName = 0;
 	LONG previousDesktopName;
 	HDESK desktop;
 	HDESK desktop2;
@@ -420,9 +416,6 @@ void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 			// If the desktop name has changed, switch to it instead of shutting down
 			KVMDEBUG("DESKTOP NAME CHANGE DETECTED, switching session", 0);
 			ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM [SLAVE]: Desktop switched to: %s (UAC/Lock screen detected)", name);
-			/* Do not touch DXGI here: this function also runs on the input thread.
-			   The capture thread will reset DXGI and force a screen refresh. */
-			InterlockedExchange(&g_desktopSwitchPending, 1);
 		}
 	}
 	else
@@ -500,6 +493,7 @@ void CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 			}
 		}
 	}
+	return desktopName;
 }
 
 unsigned char g_blockinput = 0;
@@ -957,6 +951,8 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	char *tmoBuffer;
 	long mouseMove[3] = {0, 0, 0};
 	int sentHideCursor = 0;
+	LONG captureDesktopName = 0;
+	LONG currentDesktopName;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -995,7 +991,6 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 
 	KVMDEBUG("kvm_server_mainloop / start2", (int)GetCurrentThreadId());
-	InterlockedExchange(&g_desktopSwitchPending, 0);
 
 	if (!initialize_gdiplus())
 	{
@@ -1016,7 +1011,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 
 	// Probe monitor metrics before initializing DXGI
-	CheckDesktopSwitch(1, writeHandler, reserved);
+	captureDesktopName = CheckDesktopSwitch(1, writeHandler, reserved);
 
 	// Try to initialize DXGI at startup
 	ILIBMESSAGE("KVM: Attempting DXGI initialization (Target: %d, Monitors: %d)...\r\n", SCREEN_SEL_TARGET, SCREEN_COUNT);
@@ -1073,17 +1068,22 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 #endif
 			}
 		}
-		CheckDesktopSwitch(1, writeHandler, reserved);
-		if (InterlockedExchange(&g_desktopSwitchPending, 0) != 0)
-		{
-			/* The capture thread owns all DXGI resources. Recreate them only here,
-			   after this thread has switched to the new input desktop. */
-			kvm_dxgi_cleanup();
-			kvm_server_SetResolution(writeHandler, reserved);
-			kvm_dxgi_init();
-		}
+		currentDesktopName = CheckDesktopSwitch(1, writeHandler, reserved);
 		if (g_shutdown)
 			break;
+		if (currentDesktopName != 0 && currentDesktopName != captureDesktopName)
+		{
+			/* This token describes the desktop joined by this capture thread, not a
+			   notification published by the input thread. DXGI is therefore always
+			   recreated after the capture thread has switched to the new desktop. */
+			captureDesktopName = currentDesktopName;
+			kvm_dxgi_cleanup();
+			if (!g_shutdown)
+			{
+				kvm_server_SetResolution(writeHandler, reserved);
+				if (!g_shutdown) kvm_dxgi_init();
+			}
+		}
 
 		// Enter Alertable State, so we can dispatch any packets if necessary.
 		// We are doing it here, in case we need to merge any data with the bitmaps
