@@ -1864,7 +1864,9 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	UINT srcRowBytes = srcWidth * 4;
 	for (i = 0; i < (int)srcHeight; i++)
 	{
-		int dstRow = (int)srcHeight - 1 - i; // Flip vertically
+		// Keep the visible desktop at the top of the aligned bottom-up DIB.
+		// Any tile-alignment padding therefore remains below the desktop image.
+		int dstRow = adjHeight - 1 - i;
 		memcpy(dstBase + (dstRow * dstRowPitch), sptr, srcRowBytes);
 		sptr += mappedResource.RowPitch;
 	}
