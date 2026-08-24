@@ -1168,8 +1168,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 		// Scan the desktop
 		int captureResult = 1;
+		int usedDxgiCapture = 0;
 		if (g_dxgiCtx.initialized)
 		{
+			usedDxgiCapture = 1;
 			captureResult = get_desktop_buffer_dxgi(&desktop, &desktopsize, mouseMove);
 			if (captureResult == 2) // No changes in DXGI
 			{
@@ -1178,6 +1180,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			else if (captureResult == 1) // DXGI Error/Lost
 			{
 				// Fallback to GDI immediately
+				usedDxgiCapture = 0;
 				captureResult = get_desktop_buffer(&desktop, &desktopsize, mouseMove);
 			}
 		}
@@ -1280,9 +1283,9 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
 
-		/* Frame pacing: GDI needs a fixed delay because it always captures the full screen.
-		   DXGI can go faster because AcquireNextFrame(0) is near-free when idle. */
-		if (g_dxgiCtx.initialized)
+		/* Pace according to the backend that actually handled this iteration.
+		   An initialized DXGI context can still fall back to GDI, notably when scaling. */
+		if (usedDxgiCapture)
 		{
 			if (captureResult == 2)
 			{
