@@ -1214,9 +1214,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		{
 			consecutive_capture_failures = 0;
 		}
-		if (captureResult == 2 || desktop == NULL)
+		if (captureResult != 0 || desktop == NULL)
 		{
-			// No change, skip tiling loop
+			// No valid captured frame, skip the tiling loop.
+			// Capture backends must return 0 only when desktop is safe to consume.
 		}
 		else 
 		{
@@ -1731,6 +1732,8 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	BYTE* metadataBuffer = NULL;
 	UINT metadataSize = 0;
 	int i, row, col;
+	*buffer = NULL;
+	*bufferSize = 0;
 	if (!g_dxgiCtx.initialized) return 1;
 	if (SCALING_FACTOR != 1024) 
 	{

@@ -145,11 +145,9 @@ int KVM_GetCursorHash(HCURSOR hc, char *buffer, size_t bufferLen)
 {
 	int crc = 0;
 	BITMAP bm;
-	ICONINFO ii;
+	ICONINFO ii = { 0 };
 	
-	GetIconInfo(hc, &ii);
-	
-	if (GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
+	if (GetIconInfo(hc, &ii) && ii.hbmMask != NULL && GetObject(ii.hbmMask, sizeof(bm), &bm) == sizeof(bm))
 	{
 		//printf("CX: %ul, CY:%ul, Color: %ul, Showing: %d\n", bm.bmWidth, bm.bmHeight, ii.hbmColor, info.flags);
 		HDC hdcScreen = GetDC(NULL);
@@ -160,29 +158,36 @@ int KVM_GetCursorHash(HCURSOR hc, char *buffer, size_t bufferLen)
 			if (hdcMem != NULL && hbmCanvas != NULL)
 			{
 				HGDIOBJ hbmold = SelectObject(hdcMem, hbmCanvas);
-				BITMAPINFO bmpInfo;
-				char *tmpBuffer;
+				if (hbmold != NULL && hbmold != HGDI_ERROR)
+				{
+					BITMAPINFO bmpInfo;
+					char *tmpBuffer;
 
-				ZeroMemory(&bmpInfo, sizeof(bmpInfo));
-				bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-				bmpInfo.bmiHeader.biCompression = BI_RGB;
+					ZeroMemory(&bmpInfo, sizeof(bmpInfo));
+					bmpInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+					bmpInfo.bmiHeader.biCompression = BI_RGB;
 
-				DrawIconEx(hdcMem, 0, 0, hc, bm.bmWidth, ii.hbmColor ? bm.bmHeight : (bm.bmHeight / 2), 0, NULL, DI_NORMAL);
-				GetDIBits(hdcScreen, hbmCanvas, 0, 0, NULL, &bmpInfo, DIB_RGB_COLORS);
-				if ((tmpBuffer = (char*)malloc(bmpInfo.bmiHeader.biSizeImage)) == NULL) { ILIBCRITICALEXIT(254); }
+					DrawIconEx(hdcMem, 0, 0, hc, bm.bmWidth, ii.hbmColor ? bm.bmHeight : (bm.bmHeight / 2), 0, NULL, DI_NORMAL);
+					if (GetDIBits(hdcScreen, hbmCanvas, 0, 0, NULL, &bmpInfo, DIB_RGB_COLORS) != 0 && bmpInfo.bmiHeader.biSizeImage > 0)
+					{
+						if ((tmpBuffer = (char*)malloc(bmpInfo.bmiHeader.biSizeImage)) == NULL) { ILIBCRITICALEXIT(254); }
 
-				bmpInfo.bmiHeader.biCompression = BI_RGB;
-				GetDIBits(hdcScreen, hbmCanvas, 0, (UINT)(ii.hbmColor ? bm.bmHeight : (bm.bmHeight / 2)), tmpBuffer, &bmpInfo, DIB_RGB_COLORS);
-				crc = util_crc((unsigned char*)tmpBuffer, bmpInfo.bmiHeader.biSizeImage, 0);
-
-				free(tmpBuffer);
-				SelectObject(hdcMem, hbmold);
+						bmpInfo.bmiHeader.biCompression = BI_RGB;
+						if (GetDIBits(hdcScreen, hbmCanvas, 0, (UINT)(ii.hbmColor ? bm.bmHeight : (bm.bmHeight / 2)), tmpBuffer, &bmpInfo, DIB_RGB_COLORS) != 0)
+						{
+							crc = util_crc((unsigned char*)tmpBuffer, bmpInfo.bmiHeader.biSizeImage, 0);
+						}
+						free(tmpBuffer);
+					}
+				}
 			}
+			if (hdcMem != NULL) { DeleteDC(hdcMem); }
 			if (hbmCanvas != NULL) { DeleteObject(hbmCanvas); }
-			if (hdcMem != NULL) { ReleaseDC(NULL, hdcMem); }
-			if (hdcScreen != NULL) { ReleaseDC(NULL, hdcScreen); }
+			ReleaseDC(NULL, hdcScreen);
 		}
 	}
+	if (ii.hbmMask != NULL) { DeleteObject(ii.hbmMask); }
+	if (ii.hbmColor != NULL) { DeleteObject(ii.hbmColor); }
 
 	return(crc);
 }
