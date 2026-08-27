@@ -319,7 +319,9 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 		tileInfo[row][col].crc = CRC; // Update the tile CRC in the global data structure.
 	}
 
-	tileInfo[row][col].flags = (char)TILE_MARKED_NOT_SENT;
+	// Leave DXGI-dirty flags intact until a JPEG buffer has been produced, so
+	// their CRC is not advanced when encoding fails.
+	if (tileInfo[row][col].flags != (char)TILE_DXGI_DIRTY) tileInfo[row][col].flags = (char)TILE_MARKED_NOT_SENT;
 
 
 	// COALESCING SECTION
@@ -339,7 +341,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 
 		if (CRC != tileInfo[row][rightcol].crc || tileInfo[row][rightcol].flags == (char)TILE_MARKED_NOT_SENT || tileInfo[row][rightcol].flags == (char)TILE_DXGI_DIRTY) // If the tile has changed, increment the capturewidth.
 		{
-			tileInfo[row][rightcol].crc = CRC; 
+			if (tileInfo[row][rightcol].flags != (char)TILE_DXGI_DIRTY) tileInfo[row][rightcol].crc = CRC;
 			// Here we check whether the size of the coalesced bitmap is greater than the threshold (65500)
 			//if ((captureWidth + TILE_WIDTH) * TILE_HEIGHT * PIXEL_SIZE / COMPRESSION_RATIO > 65500) { 
 			//	tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
@@ -347,7 +349,7 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 			//	break;
 			//}
 
-			tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
+			if (tileInfo[row][rightcol].flags != (char)TILE_DXGI_DIRTY) tileInfo[row][rightcol].flags = (char)TILE_MARKED_NOT_SENT;
 			captureWidth += TILE_WIDTH;
 		} 
 		else
@@ -382,8 +384,11 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 
 			if (CRC != tileInfo[botrow][rcol].crc || tileInfo[botrow][rcol].flags == (char)TILE_MARKED_NOT_SENT || tileInfo[botrow][rcol].flags == (char)TILE_DXGI_DIRTY)
 			{
-				tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
-				tileInfo[botrow][rcol].crc = CRC;
+				if (tileInfo[botrow][rcol].flags != (char)TILE_DXGI_DIRTY)
+				{
+					tileInfo[botrow][rcol].flags = (char)TILE_MARKED_NOT_SENT;
+					tileInfo[botrow][rcol].crc = CRC;
+				}
 				r_x += TILE_WIDTH;
 			}
 			else
@@ -413,7 +418,9 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 				fail = 1;
 				for (int i = col; i < rcol; i++)
 				{
-					tileInfo[botrow][i].flags = (char)TILE_MARKED_NOT_SENT;
+					// This row was not encoded. Keep dirty tiles retryable so their
+					// CRC is committed only when they are included in a JPEG.
+					if (tileInfo[botrow][i].flags != (char)TILE_DXGI_DIRTY) tileInfo[botrow][i].flags = (char)TILE_MARKED_NOT_SENT;
 				}
 				tileInfo[botrow][rcol].flags = (char)TILE_DONT_SEND;
 				botrow--;
@@ -472,6 +479,12 @@ int get_tile_at(int x, int y, void** buffer, long long *bufferSize, void *deskto
 	if (*buffer != NULL) {
 		for (int r = row; r <= botrow; r++) {
 			for (int c = col; c <= rightcol; c++) {
+				// A DXGI-dirty tile is forced into this JPEG. Commit its CRC only
+				// after encoding succeeded, so a failed encode leaves it retryable.
+				if (tileInfo[r][c].flags == (char)TILE_DXGI_DIRTY)
+				{
+					tileInfo[r][c].crc = tile_crc(c * TILE_WIDTH, r * TILE_HEIGHT, desktop, TILE_WIDTH, TILE_HEIGHT);
+				}
 				tileInfo[r][c].flags = (char)TILE_SENT;
 			}
 		}
