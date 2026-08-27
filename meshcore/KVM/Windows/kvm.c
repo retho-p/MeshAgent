@@ -40,6 +40,7 @@ limitations under the License.
 ////
 
 typedef HRESULT(WINAPI *PFN_D3D11_CREATE_DEVICE)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY1)(REFIID, void**);
 
 typedef struct DXGI_CaptureContext
 {
@@ -51,11 +52,13 @@ typedef struct DXGI_CaptureContext
 	ID3D11Texture2D* stagingTexture;
 	DXGI_OUTDUPL_DESC desc;
 	int screenSelection;
+	HMONITOR monitor;
 	int initialized;
 } DXGI_CaptureContext;
 
 DXGI_CaptureContext g_dxgiCtx;
 PFN_D3D11_CREATE_DEVICE g_D3D11CreateDevice = NULL;
+PFN_CREATE_DXGI_FACTORY1 g_CreateDXGIFactory1 = NULL;
 
 /* Persistent desktop buffer for DXGI capture — avoids malloc/free (~8 MB) per frame */
 static void *g_dxgiDesktopBuf = NULL;
@@ -133,6 +136,7 @@ int SCREEN_COUNT = -1;		// Total number of displays
 int SCREEN_SEL = 0;			// Currently selected display (0 = all)
 int SCREEN_SEL_TARGET = 0;	// Desired selected display (0 = all)
 int SCREEN_SEL_PROCESS = 0; // In process of changing displays (0 = all)
+HMONITOR SCREEN_MONITOR = NULL; // Applied monitor identity for DXGI binding
 int SCREEN_X = 0;			// Left most of current screen
 int SCREEN_Y = 0;			// Top most of current screen
 int SCREEN_WIDTH = 0;		// Width of current screen
@@ -265,6 +269,7 @@ BOOL CALLBACK DisplayInfoEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprc
 		SCREEN_HEIGHT = h;
 		SCREEN_SEL_PROCESS |= 1; // Force the new resolution to be sent to the client.
 	}
+	SCREEN_MONITOR = hMonitor;
 
 	if (SCREEN_SEL != SCREEN_SEL_TARGET)
 	{
@@ -363,6 +368,7 @@ volatile LONG kvm_server_currentDesktopname = 0;
 LONG CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *reserved)
 {
 	int x, y, w, h;
+	POINT monitorPoint;
 	LONG desktopName = 0;
 	LONG previousDesktopName;
 	HDESK desktop;
@@ -461,6 +467,17 @@ LONG CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 				y = VSCREEN_Y;
 				w = VSCREEN_WIDTH;
 				h = VSCREEN_HEIGHT;
+			}
+
+			if (SCREEN_COUNT == 1)
+			{
+				monitorPoint.x = x;
+				monitorPoint.y = y;
+				SCREEN_MONITOR = MonitorFromPoint(monitorPoint, MONITOR_DEFAULTTONULL);
+			}
+			else
+			{
+				SCREEN_MONITOR = NULL;
 			}
 
 			if (SCREEN_X != x || SCREEN_Y != y || SCREEN_WIDTH != w || SCREEN_HEIGHT != h || SCALING_FACTOR != SCALING_FACTOR_NEW)
@@ -1063,7 +1080,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		if (g_shutdown)
 			break;
 		selectionChanged = (captureScreenSelection != SCREEN_SEL) ||
-			(g_dxgiCtx.initialized && g_dxgiCtx.screenSelection != SCREEN_SEL);
+			(g_dxgiCtx.initialized && (g_dxgiCtx.screenSelection != SCREEN_SEL || g_dxgiCtx.monitor != SCREEN_MONITOR));
 		if (currentDesktopName != 0 && currentDesktopName != captureDesktopName)
 		{
 			/* This token describes the desktop joined by this capture thread, not a
@@ -1686,7 +1703,9 @@ void kvm_dxgi_cleanup()
 	if (g_dxgiCtx.hDXGI) { FreeLibrary(g_dxgiCtx.hDXGI); g_dxgiCtx.hDXGI = NULL; }
 	g_dxgiCtx.initialized = 0;
 	g_dxgiCtx.screenSelection = -1;
+	g_dxgiCtx.monitor = NULL;
 	g_D3D11CreateDevice = NULL;
+	g_CreateDXGIFactory1 = NULL;
 
 	/* Release the persistent desktop buffer when DXGI is torn down */
 	if (g_dxgiDesktopBuf) { free(g_dxgiDesktopBuf); g_dxgiDesktopBuf = NULL; }
@@ -1705,22 +1724,25 @@ int kvm_dxgi_load_libraries()
 	if (g_dxgiCtx.hDXGI == NULL) { FreeLibrary(g_dxgiCtx.hD3D11); g_dxgiCtx.hD3D11 = NULL; return 0; }
 
 	g_D3D11CreateDevice = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(g_dxgiCtx.hD3D11, "D3D11CreateDevice");
-	if (g_D3D11CreateDevice == NULL) { kvm_dxgi_cleanup(); return 0; }
+	g_CreateDXGIFactory1 = (PFN_CREATE_DXGI_FACTORY1)GetProcAddress(g_dxgiCtx.hDXGI, "CreateDXGIFactory1");
+	if (g_D3D11CreateDevice == NULL || g_CreateDXGIFactory1 == NULL) { kvm_dxgi_cleanup(); return 0; }
 	return 1;
 }
 
 int kvm_dxgi_init()
 {
 	HRESULT hr;
-	IDXGIDevice* dxgiDevice = NULL;
-	IDXGIAdapter* dxgiAdapter = NULL;
-	IDXGIFactory2* dxgiFactory = NULL;
+	IDXGIFactory1* dxgiFactory = NULL;
+	IDXGIAdapter1* dxgiAdapter = NULL;
+	IDXGIAdapter1* candidateAdapter = NULL;
 	IDXGIOutput* dxgiOutput = NULL;
 	IDXGIOutput1* dxgiOutput1 = NULL;
 	DXGI_OUTPUT_DESC outputDesc;
 	D3D_FEATURE_LEVEL featureLevel;
 	D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_1 };
 	int screenSelection = SCREEN_SEL;
+	HMONITOR screenMonitor = SCREEN_MONITOR;
+	UINT adapterIndex, outputIndex;
 
 	if (g_dxgiCtx.initialized) return 1;
 
@@ -1730,37 +1752,56 @@ int kvm_dxgi_init()
 		return 0;
 	}
 
-	// DXGI for now only supports single monitor selection (Output 0 for primary)
-	// Fallback to GDI for virtual desktop (All screens) IF more than one monitor
-	if (screenSelection == 0 && SCREEN_COUNT > 1)
+	// DXGI only supports a single applied monitor. Virtual desktop capture uses GDI.
+	if ((screenSelection == 0 && SCREEN_COUNT > 1) || screenMonitor == NULL)
 	{
-		ILIBMESSAGE("KVM: DXGI skipped (Multi-monitor + All Screens mode)\r\n");
-		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: Skipped because multiple monitors detected in 'All Screens' mode");
+		ILIBMESSAGE("KVM: DXGI skipped (no single monitor binding)\r\n");
+		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: Skipped because no single selected monitor is available");
 		return 0;
 	}
 
-	// Create Device
-	hr = g_D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION, &g_dxgiCtx.device, &featureLevel, &g_dxgiCtx.context);
-	if (FAILED(hr)) { hr = g_D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION, &g_dxgiCtx.device, &featureLevel, &g_dxgiCtx.context); }
+	/* EnumDisplayMonitors ordering is unrelated to DXGI adapter/output ordering.
+	   Locate the exact HMONITOR and create the D3D device on its adapter. */
+	hr = g_CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&dxgiFactory);
 	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
-
-	// Get DXGI Factory & Output
-	hr = g_dxgiCtx.device->lpVtbl->QueryInterface(g_dxgiCtx.device, &IID_IDXGIDevice, (void**)&dxgiDevice);
-	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
-	hr = dxgiDevice->lpVtbl->GetParent(dxgiDevice, &IID_IDXGIAdapter, (void**)&dxgiAdapter);
-	dxgiDevice->lpVtbl->Release(dxgiDevice);
-	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
-	hr = dxgiAdapter->lpVtbl->GetParent(dxgiAdapter, &IID_IDXGIFactory2, (void**)&dxgiFactory);
-	if (FAILED(hr)) { dxgiAdapter->lpVtbl->Release(dxgiAdapter); kvm_dxgi_cleanup(); return 0; }
-
-	// Find the output corresponding to the monitor selection
-	int outputIndex = (screenSelection > 0) ? (screenSelection - 1) : 0;
-	hr = dxgiAdapter->lpVtbl->EnumOutputs(dxgiAdapter, outputIndex, &dxgiOutput);
-	dxgiAdapter->lpVtbl->Release(dxgiAdapter);
+	for (adapterIndex = 0; ; adapterIndex++)
+	{
+		hr = dxgiFactory->lpVtbl->EnumAdapters1(dxgiFactory, adapterIndex, &candidateAdapter);
+		if (hr == DXGI_ERROR_NOT_FOUND) break;
+		if (FAILED(hr)) break;
+		for (outputIndex = 0; ; outputIndex++)
+		{
+			hr = candidateAdapter->lpVtbl->EnumOutputs(candidateAdapter, outputIndex, &dxgiOutput);
+			if (hr == DXGI_ERROR_NOT_FOUND) break;
+			if (FAILED(hr)) break;
+			hr = dxgiOutput->lpVtbl->GetDesc(dxgiOutput, &outputDesc);
+			if (FAILED(hr))
+			{
+				dxgiOutput->lpVtbl->Release(dxgiOutput);
+				dxgiOutput = NULL;
+				break;
+			}
+			if (outputDesc.Monitor == screenMonitor)
+			{
+				dxgiAdapter = candidateAdapter;
+				candidateAdapter = NULL;
+				break;
+			}
+			dxgiOutput->lpVtbl->Release(dxgiOutput);
+			dxgiOutput = NULL;
+		}
+		if (candidateAdapter != NULL) { candidateAdapter->lpVtbl->Release(candidateAdapter); candidateAdapter = NULL; }
+		if (dxgiAdapter != NULL) break;
+	}
 	dxgiFactory->lpVtbl->Release(dxgiFactory);
-	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
+	if (dxgiAdapter == NULL || dxgiOutput == NULL) { if (dxgiAdapter) dxgiAdapter->lpVtbl->Release(dxgiAdapter); kvm_dxgi_cleanup(); return 0; }
+
+	// Desktop Duplication requires the device associated with the selected output's adapter.
+	hr = g_D3D11CreateDevice((IDXGIAdapter*)dxgiAdapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION, &g_dxgiCtx.device, &featureLevel, &g_dxgiCtx.context);
+	dxgiAdapter->lpVtbl->Release(dxgiAdapter);
+	if (FAILED(hr)) { dxgiOutput->lpVtbl->Release(dxgiOutput); kvm_dxgi_cleanup(); return 0; }
+
 	hr = dxgiOutput->lpVtbl->QueryInterface(dxgiOutput, &IID_IDXGIOutput1, (void**)&dxgiOutput1);
-	dxgiOutput->lpVtbl->GetDesc(dxgiOutput, &outputDesc);
 	dxgiOutput->lpVtbl->Release(dxgiOutput);
 	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
 	hr = dxgiOutput1->lpVtbl->DuplicateOutput(dxgiOutput1, (IUnknown*)g_dxgiCtx.device, &g_dxgiCtx.duplication);
@@ -1796,6 +1837,7 @@ int kvm_dxgi_init()
 	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
 	g_dxgiCtx.initialized = 1;
 	g_dxgiCtx.screenSelection = screenSelection;
+	g_dxgiCtx.monitor = outputDesc.Monitor;
 	return 1;
 }
 
