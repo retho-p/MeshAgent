@@ -501,6 +501,9 @@ LONG CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 			// Get the list of monitors
 			if (SCREEN_SEL_PROCESS == 0)
 			{
+				/* Do not retain an unplugged monitor identity when the requested
+				   selection is no longer present in the current topology. */
+				SCREEN_MONITOR = NULL;
 				DWORD selection = SCREEN_SEL_TARGET;
 				if (EnumDisplayMonitors(NULL, NULL, DisplayInfoEnumProc, (LPARAM)&selection))
 				{
