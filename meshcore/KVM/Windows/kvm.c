@@ -156,6 +156,9 @@ int g_remotepause = 1;
 int g_restartcount = 0;
 struct tileInfo_t **tileInfo = NULL;
 int g_slavekvm = 0;
+/* Incremented by MNG_KVM_REFRESH. The capture thread consumes one pending
+   refresh per full GDI frame, even when DXGI is idle. */
+static volatile LONG g_kvmRefreshPending = 0;
 static ILibProcessPipe_Process gChildProcess;
 int kvm_relay_restart(int paused, void *pipeMgr, char *exePath, ILibKVM_WriteHandler writeHandler, void *reserved);
 
@@ -624,7 +627,6 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 	}
 	case MNG_KVM_REFRESH: // Refresh
 	{
-		int row, col;
 		char buffer[8];
 		if (size != 4)
 			break;
@@ -639,25 +641,11 @@ int kvm_server_inputdata(char *block, int blocklen, ILibKVM_WriteHandler writeHa
 		// Send the list of available displays
 		kvm_send_display_list(writeHandler, reserved);
 
-		// Reset all tile information
-		if (tileInfo == NULL)
-		{
-			if ((tileInfo = (struct tileInfo_t **)malloc(TILE_HEIGHT_COUNT * sizeof(struct tileInfo_t *))) == NULL)
-				ILIBCRITICALEXIT(254);
-			for (row = 0; row < TILE_HEIGHT_COUNT; row++)
-			{
-				if ((tileInfo[row] = (struct tileInfo_t *)malloc(TILE_WIDTH_COUNT * sizeof(struct tileInfo_t))) == NULL)
-					ILIBCRITICALEXIT(254);
-			}
-		}
-		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
-		{
-			for (col = 0; col < TILE_WIDTH_COUNT; col++)
-			{
-				tileInfo[row][col].crc = 0xFF;
-				tileInfo[row][col].flags = 0;
-			}
-		}
+		/* Tile state belongs to the capture thread. It will mark every tile
+		   force-send before consuming this pending refresh. */
+		/* Desktop Duplication can time out indefinitely on an idle desktop, so
+		   request a real GDI full-frame capture instead of relying on DXGI damage. */
+		InterlockedIncrement(&g_kvmRefreshPending);
 
 		break;
 	}
@@ -1055,19 +1043,12 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	// Loop and send only when a tile changes.
 	while (!g_shutdown)
 	{
+		int forceGdiFullFrame;
+		int forceGdiRendersCursor;
+		int fullFrameGdiProcessed = 0;
+		int restoreDxgiCursorAfterGdi = 0;
 		KVMDEBUG("kvm_server_mainloop / loop1", (int)GetCurrentThreadId());
-
-		// Reset all the flags to TILE_TODO
-		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
-		{
-			for (col = 0; col < TILE_WIDTH_COUNT; col++)
-			{
-				tileInfo[row][col].flags = (char)TILE_TODO;
-#ifdef KVM_ALL_TILES
-				tileInfo[row][col].crc = 0xFF;
-#endif
-			}
-		}
+		forceGdiFullFrame = (InterlockedCompareExchange(&g_kvmRefreshPending, 0, 0) > 0);
 		currentDesktopName = CheckDesktopSwitch(1, writeHandler, reserved);
 		if (g_shutdown)
 			break;
@@ -1082,6 +1063,20 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			{
 				kvm_server_SetResolution(writeHandler, reserved);
 				if (!g_shutdown) kvm_dxgi_init();
+			}
+		}
+		forceGdiRendersCursor = (forceGdiFullFrame && SCALING_FACTOR == 1024);
+
+		/* CheckDesktopSwitch() can rebuild tileInfo through SetResolution(). Reset
+		   tile state only afterwards so a pending refresh remains force-send. */
+		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
+		{
+			for (col = 0; col < TILE_WIDTH_COUNT; col++)
+			{
+				tileInfo[row][col].flags = (char)(forceGdiFullFrame ? TILE_DXGI_DIRTY : TILE_TODO);
+#ifdef KVM_ALL_TILES
+				tileInfo[row][col].crc = 0xFF;
+#endif
 			}
 		}
 
@@ -1143,7 +1138,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			// With DXGI, the client keeps its own cursor visible because DXGI
 			// may report "no changes" (idle screen) and skip frame transmission,
 			// which would leave the user with no visible cursor at all.
-			if (sentHideCursor == 0 && !g_dxgiCtx.initialized)
+			if (sentHideCursor == 0 && (!g_dxgiCtx.initialized || forceGdiRendersCursor))
 			{
 				sentHideCursor = 1;
 				char tmpBuffer[5];
@@ -1151,6 +1146,10 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
 				tmpBuffer[4] = (char)KVM_MouseCursor_NONE;														// Cursor Type
 				writeHandler(tmpBuffer, 5, reserved);
+			}
+			if (forceGdiRendersCursor && g_dxgiCtx.initialized)
+			{
+				restoreDxgiCursorAfterGdi = 1;
 			}
 		}
 		else
@@ -1169,7 +1168,14 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		// Scan the desktop
 		int captureResult = 1;
 		int usedDxgiCapture = 0;
-		if (g_dxgiCtx.initialized)
+		if (forceGdiFullFrame)
+		{
+			/* A refresh is a correctness request, not merely a request to retry
+			   DXGI metadata. GDI supplies an image even when AcquireNextFrame() would
+			   return DXGI_ERROR_WAIT_TIMEOUT on an unchanged desktop. */
+			captureResult = get_desktop_buffer(&desktop, &desktopsize, mouseMove);
+		}
+		else if (g_dxgiCtx.initialized)
 		{
 			usedDxgiCapture = 1;
 			captureResult = get_desktop_buffer_dxgi(&desktop, &desktopsize, mouseMove);
@@ -1280,6 +1286,38 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				free(desktop);
 			desktop = NULL;
 			desktopsize = 0;
+			if (forceGdiFullFrame && !g_shutdown && SCALING_FACTOR == SCALING_FACTOR_NEW)
+			{
+				fullFrameGdiProcessed = 1;
+				for (row = 0; row < TILE_HEIGHT_COUNT && fullFrameGdiProcessed; row++)
+				{
+					for (col = 0; col < TILE_WIDTH_COUNT; col++)
+					{
+						if (tileInfo[row][col].flags != (char)TILE_SENT)
+						{
+							fullFrameGdiProcessed = 0;
+							break;
+						}
+					}
+				}
+			}
+		}
+		if (fullFrameGdiProcessed)
+		{
+			/* Consume exactly one refresh. New refreshes remain pending for their
+		   own full GDI frame. */
+			InterlockedDecrement(&g_kvmRefreshPending);
+		}
+		if (restoreDxgiCursorAfterGdi)
+		{
+			/* The forced GDI frame contains the cursor. Restore the DXGI client
+		   cursor afterwards so an idle DXGI desktop does not leave it hidden. */
+			sentHideCursor = 0;
+			char tmpBuffer[5];
+			((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);
+			((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);
+			tmpBuffer[4] = (char)gCurrentCursor;
+			writeHandler(tmpBuffer, 5, reserved);
 		}
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());

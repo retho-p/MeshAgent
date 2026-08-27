@@ -34,7 +34,7 @@ enum TILE_FLAGS_ENUM {
 	TILE_SENT,				// CRC has been calculated and the tile has been sent.
 	TILE_MARKED_NOT_SENT,	// CRC has been calculated, but the tile was not sent.
 	TILE_DONT_SEND,			// CRC has been calculated, tile need not be sent.
-	TILE_DXGI_DIRTY			// DXGI dirty rects identified this tile as changed — skip CRC.
+	TILE_DXGI_DIRTY			// DXGI dirty rects or a forced refresh identified this tile as changed — skip CRC.
 	//TILE_SKIPPED			// CRC has been calculated, tile need not be sent, but was skipped to include a greater region
 };
 
