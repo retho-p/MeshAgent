@@ -1722,6 +1722,34 @@ int kvm_dxgi_init()
 	return 1;
 }
 
+/* Mark the tiles intersecting a metadata rectangle. Reject out-of-bounds
+   coordinates so an invalid metadata set falls back to a full CRC scan. */
+static int kvm_dxgi_mark_rect_tiles(char* tileFlags, long long left, long long top, long long right, long long bottom)
+{
+	int startRow, endRow, startCol, endCol, row, col;
+	if (tileFlags == NULL || TILE_WIDTH <= 0 || TILE_HEIGHT <= 0 || TILE_WIDTH_COUNT <= 0 || TILE_HEIGHT_COUNT <= 0) return 0;
+	if (left < 0 || top < 0 || right > SCREEN_WIDTH || bottom > SCREEN_HEIGHT) return 0;
+	if (left >= right || top >= bottom) return 0;
+
+	startRow = (int)(top / TILE_HEIGHT);
+	endRow = (int)((bottom + TILE_HEIGHT - 1) / TILE_HEIGHT);
+	startCol = (int)(left / TILE_WIDTH);
+	endCol = (int)((right + TILE_WIDTH - 1) / TILE_WIDTH);
+	if (startRow < 0) startRow = 0;
+	if (startCol < 0) startCol = 0;
+	if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
+	if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
+
+	for (row = startRow; row < endRow; row++)
+	{
+		for (col = startCol; col < endCol; col++)
+		{
+			tileFlags[((size_t)row * (size_t)TILE_WIDTH_COUNT) + (size_t)col] = (char)TILE_DXGI_DIRTY;
+		}
+	}
+	return 1;
+}
+
 int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMove)
 {
 	HRESULT hr;
@@ -1730,7 +1758,11 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	ID3D11Texture2D* desktopImage = NULL;
 	D3D11_MAPPED_SUBRESOURCE mappedResource;
 	BYTE* metadataBuffer = NULL;
+	char* metadataTileFlags = NULL;
 	UINT metadataSize = 0;
+	size_t metadataTileCount = 0;
+	int metadataValid = 0;
+	int metadataRectCount = 0;
 	int i, row, col;
 	*buffer = NULL;
 	*bufferSize = 0;
@@ -1790,69 +1822,82 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	if (frameInfo.LastPresentTime.QuadPart != 0 &&
 		(g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_UNSPECIFIED || g_dxgiCtx.desc.Rotation == DXGI_MODE_ROTATION_IDENTITY))
 	{
-		for (row = 0; row < TILE_HEIGHT_COUNT; row++) { for (col = 0; col < TILE_WIDTH_COUNT; col++) { tileInfo[row][col].flags = (char)TILE_DONT_SEND; } }
-
+		/* TILE_TODO is the fail-safe state. Publish the optimized tile map only
+		   after both metadata calls succeed, all rectangles are validated, and
+		   the captured framebuffer is ready for tiling. */
+		for (row = 0; row < TILE_HEIGHT_COUNT; row++) { for (col = 0; col < TILE_WIDTH_COUNT; col++) { tileInfo[row][col].flags = (char)TILE_TODO; } }
 		if (frameInfo.TotalMetadataBufferSize > 0)
 		{
-			metadataBuffer = (BYTE*)malloc(frameInfo.TotalMetadataBufferSize);
-			if (metadataBuffer)
+			if (TILE_WIDTH_COUNT > 0 && TILE_HEIGHT_COUNT > 0)
 			{
-				// Mark tiles overlapping dirty regions for re-encoding
-				metadataSize = frameInfo.TotalMetadataBufferSize;
-				if (SUCCEEDED(g_dxgiCtx.duplication->lpVtbl->GetFrameDirtyRects(g_dxgiCtx.duplication, metadataSize, (RECT*)metadataBuffer, &metadataSize)))
+				metadataTileCount = (size_t)TILE_WIDTH_COUNT * (size_t)TILE_HEIGHT_COUNT;
+				if (metadataTileCount / (size_t)TILE_WIDTH_COUNT == (size_t)TILE_HEIGHT_COUNT)
 				{
-					RECT* rects = (RECT*)metadataBuffer;
-					int rectCount = metadataSize / sizeof(RECT);
-					for (i = 0; i < rectCount; i++)
-					{
-						int startRow = rects[i].top / TILE_HEIGHT;
-						int endRow = (rects[i].bottom + TILE_HEIGHT - 1) / TILE_HEIGHT;
-						int startCol = rects[i].left / TILE_WIDTH;
-						int endCol = (rects[i].right + TILE_WIDTH - 1) / TILE_WIDTH;
-						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
-						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
-					}
+					metadataBuffer = (BYTE*)malloc(frameInfo.TotalMetadataBufferSize);
+					metadataTileFlags = (char*)malloc(metadataTileCount);
 				}
+			}
+			if (metadataBuffer != NULL && metadataTileFlags != NULL)
+			{
+				memset(metadataTileFlags, (char)TILE_DONT_SEND, metadataTileCount);
+				metadataValid = 1;
 
-				// Process move rects (e.g. scrolling) — mark both source and destination tiles
+				// Process move rects before dirty rects, as required by DXGI.
 				metadataSize = frameInfo.TotalMetadataBufferSize;
-				if (SUCCEEDED(g_dxgiCtx.duplication->lpVtbl->GetFrameMoveRects(g_dxgiCtx.duplication, metadataSize, (DXGI_OUTDUPL_MOVE_RECT*)metadataBuffer, &metadataSize)))
+				hr = g_dxgiCtx.duplication->lpVtbl->GetFrameMoveRects(g_dxgiCtx.duplication, metadataSize, (DXGI_OUTDUPL_MOVE_RECT*)metadataBuffer, &metadataSize);
+				if (FAILED(hr) || metadataSize > frameInfo.TotalMetadataBufferSize || (metadataSize % sizeof(DXGI_OUTDUPL_MOVE_RECT)) != 0)
+				{
+					metadataValid = 0;
+				}
+				else
 				{
 					DXGI_OUTDUPL_MOVE_RECT* moveRects = (DXGI_OUTDUPL_MOVE_RECT*)metadataBuffer;
 					int moveCount = metadataSize / sizeof(DXGI_OUTDUPL_MOVE_RECT);
-					for (i = 0; i < moveCount; i++)
+					metadataRectCount += moveCount;
+					for (i = 0; i < moveCount && metadataValid; i++)
 					{
-						// Mark destination rect tiles
-						int startRow = moveRects[i].DestinationRect.top / TILE_HEIGHT;
-						int endRow = (moveRects[i].DestinationRect.bottom + TILE_HEIGHT - 1) / TILE_HEIGHT;
-						int startCol = moveRects[i].DestinationRect.left / TILE_WIDTH;
-						int endCol = (moveRects[i].DestinationRect.right + TILE_WIDTH - 1) / TILE_WIDTH;
-						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
-						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
-
-						// Mark source area tiles (SourcePoint + same size as destination)
-						int moveW = moveRects[i].DestinationRect.right - moveRects[i].DestinationRect.left;
-						int moveH = moveRects[i].DestinationRect.bottom - moveRects[i].DestinationRect.top;
-						startRow = moveRects[i].SourcePoint.y / TILE_HEIGHT;
-						endRow = (moveRects[i].SourcePoint.y + moveH + TILE_HEIGHT - 1) / TILE_HEIGHT;
-						startCol = moveRects[i].SourcePoint.x / TILE_WIDTH;
-						endCol = (moveRects[i].SourcePoint.x + moveW + TILE_WIDTH - 1) / TILE_WIDTH;
-						if (startRow < 0) startRow = 0;
-						if (startCol < 0) startCol = 0;
-						if (endRow > TILE_HEIGHT_COUNT) endRow = TILE_HEIGHT_COUNT;
-						if (endCol > TILE_WIDTH_COUNT) endCol = TILE_WIDTH_COUNT;
-						for (row = startRow; row < endRow; row++) { for (col = startCol; col < endCol; col++) { tileInfo[row][col].flags = (char)TILE_DXGI_DIRTY; } }
+						long long moveWidth = (long long)moveRects[i].DestinationRect.right - (long long)moveRects[i].DestinationRect.left;
+						long long moveHeight = (long long)moveRects[i].DestinationRect.bottom - (long long)moveRects[i].DestinationRect.top;
+						metadataValid = kvm_dxgi_mark_rect_tiles(metadataTileFlags,
+							moveRects[i].DestinationRect.left, moveRects[i].DestinationRect.top,
+							moveRects[i].DestinationRect.right, moveRects[i].DestinationRect.bottom);
+						if (metadataValid)
+						{
+							metadataValid = kvm_dxgi_mark_rect_tiles(metadataTileFlags,
+								moveRects[i].SourcePoint.x, moveRects[i].SourcePoint.y,
+								(long long)moveRects[i].SourcePoint.x + moveWidth,
+								(long long)moveRects[i].SourcePoint.y + moveHeight);
+						}
 					}
 				}
 
-				free(metadataBuffer);
+				if (metadataValid)
+				{
+					metadataSize = frameInfo.TotalMetadataBufferSize;
+					hr = g_dxgiCtx.duplication->lpVtbl->GetFrameDirtyRects(g_dxgiCtx.duplication, metadataSize, (RECT*)metadataBuffer, &metadataSize);
+					if (FAILED(hr) || metadataSize > frameInfo.TotalMetadataBufferSize || (metadataSize % sizeof(RECT)) != 0)
+					{
+						metadataValid = 0;
+					}
+					else
+					{
+						RECT* rects = (RECT*)metadataBuffer;
+						int rectCount = metadataSize / sizeof(RECT);
+						metadataRectCount += rectCount;
+						for (i = 0; i < rectCount && metadataValid; i++)
+						{
+							metadataValid = kvm_dxgi_mark_rect_tiles(metadataTileFlags,
+								rects[i].left, rects[i].top, rects[i].right, rects[i].bottom);
+						}
+					}
+				}
 			}
-		}
-		else
-		{
-			for (row = 0; row < TILE_HEIGHT_COUNT; row++) { for (col = 0; col < TILE_WIDTH_COUNT; col++) { tileInfo[row][col].flags = (char)TILE_TODO; } }
+			if (metadataBuffer != NULL) { free(metadataBuffer); metadataBuffer = NULL; }
+			if (!metadataValid || metadataRectCount <= 0)
+			{
+				if (metadataTileFlags != NULL) free(metadataTileFlags);
+				metadataTileFlags = NULL;
+			}
 		}
 	}
 
@@ -1861,12 +1906,17 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 
 	if (g_dxgiCtx.desc.ModeDesc.Width != (UINT)SCREEN_WIDTH || g_dxgiCtx.desc.ModeDesc.Height != (UINT)SCREEN_HEIGHT)
 	{
+		if (metadataTileFlags != NULL) free(metadataTileFlags);
 		kvm_dxgi_cleanup();
 		return 1;
 	}
 
 	hr = g_dxgiCtx.context->lpVtbl->Map(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
-	if (FAILED(hr)) return 1;
+	if (FAILED(hr))
+	{
+		if (metadataTileFlags != NULL) free(metadataTileFlags);
+		return 1;
+	}
 
 	// Align buffer dimensions to tile boundaries (must match adjust_screen_size in tile.cpp)
 	int adjWidth = SCALED_WIDTH;
@@ -1899,6 +1949,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		{
 			g_dxgiDesktopBufSize = 0;
 			g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
+			if (metadataTileFlags != NULL) free(metadataTileFlags);
 			return 1;
 		}
 		/* Zero only on first allocation — the flipped row copy below overwrites
@@ -1940,6 +1991,17 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	}
 
 	g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
+	if (metadataTileFlags != NULL)
+	{
+		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
+		{
+			for (col = 0; col < TILE_WIDTH_COUNT; col++)
+			{
+				tileInfo[row][col].flags = metadataTileFlags[((size_t)row * (size_t)TILE_WIDTH_COUNT) + (size_t)col];
+			}
+		}
+		free(metadataTileFlags);
+	}
 
 	return 0;
 }
