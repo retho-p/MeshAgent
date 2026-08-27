@@ -50,6 +50,7 @@ typedef struct DXGI_CaptureContext
 	IDXGIOutputDuplication* duplication;
 	ID3D11Texture2D* stagingTexture;
 	DXGI_OUTDUPL_DESC desc;
+	int screenSelection;
 	int initialized;
 } DXGI_CaptureContext;
 
@@ -941,6 +942,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	int sentHideCursor = 0;
 	LONG captureDesktopName = 0;
 	LONG currentDesktopName;
+	int captureScreenSelection;
 
 	gPendingPackets = ILibQueue_Create();
 	KVM_InitMouseCursors(gPendingPackets);
@@ -1000,6 +1002,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 
 	// Probe monitor metrics before initializing DXGI
 	captureDesktopName = CheckDesktopSwitch(1, writeHandler, reserved);
+	captureScreenSelection = SCREEN_SEL;
 
 	// Try to initialize DXGI at startup
 	ILIBMESSAGE("KVM: Attempting DXGI initialization (Target: %d, Monitors: %d)...\r\n", SCREEN_SEL_TARGET, SCREEN_COUNT);
@@ -1047,11 +1050,20 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 		int forceGdiRendersCursor;
 		int fullFrameGdiProcessed = 0;
 		int restoreDxgiCursorAfterGdi = 0;
+		int refreshWasPending;
+		int selectionChanged;
+		int screenXBefore = SCREEN_X;
+		int screenYBefore = SCREEN_Y;
+		int screenWidthBefore = SCREEN_WIDTH;
+		int screenHeightBefore = SCREEN_HEIGHT;
 		KVMDEBUG("kvm_server_mainloop / loop1", (int)GetCurrentThreadId());
-		forceGdiFullFrame = (InterlockedCompareExchange(&g_kvmRefreshPending, 0, 0) > 0);
+		refreshWasPending = (InterlockedCompareExchange(&g_kvmRefreshPending, 0, 0) > 0);
+		forceGdiFullFrame = refreshWasPending;
 		currentDesktopName = CheckDesktopSwitch(1, writeHandler, reserved);
 		if (g_shutdown)
 			break;
+		selectionChanged = (captureScreenSelection != SCREEN_SEL) ||
+			(g_dxgiCtx.initialized && g_dxgiCtx.screenSelection != SCREEN_SEL);
 		if (currentDesktopName != 0 && currentDesktopName != captureDesktopName)
 		{
 			/* This token describes the desktop joined by this capture thread, not a
@@ -1062,8 +1074,32 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			if (!g_shutdown)
 			{
 				kvm_server_SetResolution(writeHandler, reserved);
+				captureScreenSelection = SCREEN_SEL;
 				if (!g_shutdown) kvm_dxgi_init();
 			}
+			if (selectionChanged)
+			{
+				forceGdiFullFrame = 1;
+			}
+		}
+		else if (selectionChanged)
+		{
+			/* MNG_KVM_SET_DISPLAY is received on the input thread, but both the
+		   output duplication and the capture rectangle belong to this thread.
+		   Rebuild them together so an equal-sized monitor cannot retain the
+		   previous IDXGIOutput. */
+			ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: display selection changed from %d to %d", captureScreenSelection, SCREEN_SEL);
+			kvm_dxgi_cleanup();
+			if (screenXBefore == SCREEN_X && screenYBefore == SCREEN_Y && screenWidthBefore == SCREEN_WIDTH && screenHeightBefore == SCREEN_HEIGHT)
+			{
+				/* Mirrored or equal-geometry outputs still need a fresh tile map. */
+				kvm_server_SetResolution(writeHandler, reserved);
+			}
+			captureScreenSelection = SCREEN_SEL;
+			if (!g_shutdown) kvm_dxgi_init();
+			/* The newly selected desktop must be complete before DXGI metadata
+			   optimization resumes, even if it is idle immediately after switching. */
+			forceGdiFullFrame = 1;
 		}
 		forceGdiRendersCursor = (forceGdiFullFrame && SCALING_FACTOR == 1024);
 
@@ -1302,7 +1338,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				}
 			}
 		}
-		if (fullFrameGdiProcessed)
+		if (fullFrameGdiProcessed && refreshWasPending)
 		{
 			/* Consume exactly one refresh. New refreshes remain pending for their
 		   own full GDI frame. */
@@ -1649,6 +1685,7 @@ void kvm_dxgi_cleanup()
 	if (g_dxgiCtx.hD3D11) { FreeLibrary(g_dxgiCtx.hD3D11); g_dxgiCtx.hD3D11 = NULL; }
 	if (g_dxgiCtx.hDXGI) { FreeLibrary(g_dxgiCtx.hDXGI); g_dxgiCtx.hDXGI = NULL; }
 	g_dxgiCtx.initialized = 0;
+	g_dxgiCtx.screenSelection = -1;
 	g_D3D11CreateDevice = NULL;
 
 	/* Release the persistent desktop buffer when DXGI is torn down */
@@ -1683,6 +1720,7 @@ int kvm_dxgi_init()
 	DXGI_OUTPUT_DESC outputDesc;
 	D3D_FEATURE_LEVEL featureLevel;
 	D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_1 };
+	int screenSelection = SCREEN_SEL;
 
 	if (g_dxgiCtx.initialized) return 1;
 
@@ -1694,7 +1732,7 @@ int kvm_dxgi_init()
 
 	// DXGI for now only supports single monitor selection (Output 0 for primary)
 	// Fallback to GDI for virtual desktop (All screens) IF more than one monitor
-	if (SCREEN_SEL_TARGET == 0 && SCREEN_COUNT > 1) 
+	if (screenSelection == 0 && SCREEN_COUNT > 1)
 	{
 		ILIBMESSAGE("KVM: DXGI skipped (Multi-monitor + All Screens mode)\r\n");
 		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: Skipped because multiple monitors detected in 'All Screens' mode");
@@ -1716,7 +1754,7 @@ int kvm_dxgi_init()
 	if (FAILED(hr)) { dxgiAdapter->lpVtbl->Release(dxgiAdapter); kvm_dxgi_cleanup(); return 0; }
 
 	// Find the output corresponding to the monitor selection
-	int outputIndex = (SCREEN_SEL_TARGET > 0) ? (SCREEN_SEL_TARGET - 1) : 0;
+	int outputIndex = (screenSelection > 0) ? (screenSelection - 1) : 0;
 	hr = dxgiAdapter->lpVtbl->EnumOutputs(dxgiAdapter, outputIndex, &dxgiOutput);
 	dxgiAdapter->lpVtbl->Release(dxgiAdapter);
 	dxgiFactory->lpVtbl->Release(dxgiFactory);
@@ -1757,6 +1795,7 @@ int kvm_dxgi_init()
 	hr = g_dxgiCtx.device->lpVtbl->CreateTexture2D(g_dxgiCtx.device, &stagingDesc, NULL, &g_dxgiCtx.stagingTexture);
 	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 0; }
 	g_dxgiCtx.initialized = 1;
+	g_dxgiCtx.screenSelection = screenSelection;
 	return 1;
 }
 
