@@ -1073,7 +1073,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	captureScreenSelection = SCREEN_SEL;
 
 	// Try to initialize DXGI at startup
-	ILIBMESSAGE("KVM: Attempting DXGI initialization (Target: %d, Monitors: %d)...\r\n", SCREEN_SEL_TARGET, SCREEN_COUNT);
+	ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "KVM: Attempting DXGI initialization (Target: %d, Monitors: %d)", SCREEN_SEL_TARGET, SCREEN_COUNT);
 	if (kvm_dxgi_init())
 	{
 		ILIBMESSAGE("KVM: DXGI Desktop Duplication INITIALIZED SUCCESS\r\n");
@@ -1306,7 +1306,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			// No valid captured frame, skip the tiling loop.
 			// Capture backends must return 0 only when desktop is safe to consume.
 		}
-		else 
+		else
 		{
 			bmpInfo = get_bmp_info(TILE_WIDTH, TILE_HEIGHT);
 			for (row = 0; row < TILE_HEIGHT_COUNT; row++) {
@@ -2082,7 +2082,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	*buffer = NULL;
 	*bufferSize = 0;
 	if (!g_dxgiCtx.initialized) return 1;
-	if (SCALING_FACTOR != 1024) 
+	if (SCALING_FACTOR != 1024)
 	{
 		static int scaling_log_sent = 0;
 		if (scaling_log_sent == 0) { ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: Capture skipped because scaling is active (%d/1024)", SCALING_FACTOR); scaling_log_sent = 1; }
