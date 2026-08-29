@@ -53,12 +53,29 @@ typedef struct DXGI_CaptureContext
 	DXGI_OUTDUPL_DESC desc;
 	int screenSelection;
 	HMONITOR monitor;
+	BYTE* pointerShapeBuffer;
+	UINT pointerShapeBufferCapacity;
+	UINT pointerShapeBufferSize;
+	DXGI_OUTDUPL_POINTER_SHAPE_INFO pointerShapeInfo;
+	POINT pointerPosition;
+	RECT previousPointerRect;
+	int pointerShapeValid;
+	int pointerStateKnown;
+	int pointerVisible;
+	int previousPointerRectValid;
+	int clientCursorVisible;
 	int initialized;
 } DXGI_CaptureContext;
 
 DXGI_CaptureContext g_dxgiCtx;
 PFN_D3D11_CREATE_DEVICE g_D3D11CreateDevice = NULL;
 PFN_CREATE_DXGI_FACTORY1 g_CreateDXGIFactory1 = NULL;
+
+typedef struct DisplaySelectionContext
+{
+	DWORD remaining;
+	BOOL found;
+} DisplaySelectionContext;
 
 /* Persistent desktop buffer for DXGI capture — avoids malloc/free (~8 MB) per frame */
 static void *g_dxgiDesktopBuf = NULL;
@@ -82,6 +99,17 @@ int gProcessTSID = -1;
 extern int gRemoteMouseRenderDefault;
 int gRemoteMouseMoved = 0;
 extern int gCurrentCursor;
+
+static void kvm_set_client_cursor_visible(ILibKVM_WriteHandler writeHandler, void* reserved, int* sentHideCursor, int visible)
+{
+	char buffer[5];
+	if ((visible && *sentHideCursor == 0) || (!visible && *sentHideCursor != 0)) return;
+	((unsigned short *)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);
+	((unsigned short *)buffer)[1] = (unsigned short)htons((unsigned short)5);
+	buffer[4] = (char)(visible ? gCurrentCursor : KVM_MouseCursor_NONE);
+	writeHandler(buffer, 5, reserved);
+	*sentHideCursor = visible ? 0 : 1;
+}
 
 #pragma pack(push, 1)
 typedef struct KVMDebugLog
@@ -241,7 +269,7 @@ BOOL CALLBACK DisplayInfoEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprc
 {
 	int w, h, deviceid = 0;
 	MONITORINFOEX mi;
-	DWORD *selection = (DWORD *)dwData;
+	DisplaySelectionContext *selection = (DisplaySelectionContext *)dwData;
 	UNREFERENCED_PARAMETER(hdcMonitor);
 	UNREFERENCED_PARAMETER(lprcMonitor);
 
@@ -253,10 +281,11 @@ BOOL CALLBACK DisplayInfoEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprc
 		return TRUE;
 	if (sscanf_s(mi.szDevice, "\\\\.\\DISPLAY%d", &deviceid) != 1)
 		return TRUE;
-	if (--selection[0] > 0)
+	if (selection->found || --selection->remaining > 0)
 	{
 		return TRUE;
 	}
+	selection->found = TRUE;
 
 	// See if anything changed
 	w = abs(mi.rcMonitor.left - mi.rcMonitor.right);
@@ -504,14 +533,33 @@ LONG CheckDesktopSwitch(int checkres, ILibKVM_WriteHandler writeHandler, void *r
 				/* Do not retain an unplugged monitor identity when the requested
 				   selection is no longer present in the current topology. */
 				SCREEN_MONITOR = NULL;
-				DWORD selection = SCREEN_SEL_TARGET;
-				if (EnumDisplayMonitors(NULL, NULL, DisplayInfoEnumProc, (LPARAM)&selection))
+				DisplaySelectionContext selection = { (DWORD)SCREEN_SEL_TARGET, FALSE };
+				if (EnumDisplayMonitors(NULL, NULL, DisplayInfoEnumProc, (LPARAM)&selection) && selection.found)
 				{
 					// Set the resolution
 					if (SCREEN_SEL_PROCESS & 1)
 						kvm_server_SetResolution(writeHandler, reserved);
 					if (SCREEN_SEL_PROCESS & 2)
 						kvm_send_display_list(writeHandler, reserved);
+				}
+				else
+				{
+					/* The requested monitor disappeared. Fall back to the virtual desktop
+					   instead of retaining the vanished monitor's capture rectangle. */
+					SCREEN_SEL_TARGET = 0;
+					SCREEN_SEL = 0;
+					SCREEN_X = VSCREEN_WIDTH == 0 ? 0 : VSCREEN_X;
+					SCREEN_Y = VSCREEN_HEIGHT == 0 ? 0 : VSCREEN_Y;
+					SCREEN_WIDTH = VSCREEN_WIDTH == 0 ? GetSystemMetrics(SM_CXSCREEN) : VSCREEN_WIDTH;
+					SCREEN_HEIGHT = VSCREEN_HEIGHT == 0 ? GetSystemMetrics(SM_CYSCREEN) : VSCREEN_HEIGHT;
+					if (SCREEN_COUNT == 1)
+					{
+						monitorPoint.x = SCREEN_X;
+						monitorPoint.y = SCREEN_Y;
+						SCREEN_MONITOR = MonitorFromPoint(monitorPoint, MONITOR_DEFAULTTONULL);
+					}
+					kvm_server_SetResolution(writeHandler, reserved);
+					kvm_send_display_list(writeHandler, reserved);
 				}
 				SCREEN_SEL_PROCESS = 0;
 			}
@@ -1067,9 +1115,7 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 	while (!g_shutdown)
 	{
 		int forceGdiFullFrame;
-		int forceGdiRendersCursor;
 		int fullFrameGdiProcessed = 0;
-		int restoreDxgiCursorAfterGdi = 0;
 		int refreshWasPending;
 		int selectionChanged;
 		int screenXBefore = SCREEN_X;
@@ -1121,7 +1167,6 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			   optimization resumes, even if it is idle immediately after switching. */
 			forceGdiFullFrame = 1;
 		}
-		forceGdiRendersCursor = (forceGdiFullFrame && SCALING_FACTOR == 1024);
 
 		/* CheckDesktopSwitch() can rebuild tileInfo through SetResolution(). Reset
 		   tile state only afterwards so a pending refresh remains force-send. */
@@ -1188,37 +1233,11 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 				mouseMove[2] = info.ptScreenPos.y - SCREEN_Y;
 			}
 		}
-		if (mouseMove[0] != 0)
+		/* GDI at native scale composites the cursor. For DXGI, preserve the
+		   previous ownership decision until a frame supplies pointer metadata. */
+		if (forceGdiFullFrame || !g_dxgiCtx.initialized)
 		{
-			// Only hide the client cursor when using GDI capture.
-			// With DXGI, the client keeps its own cursor visible because DXGI
-			// may report "no changes" (idle screen) and skip frame transmission,
-			// which would leave the user with no visible cursor at all.
-			if (sentHideCursor == 0 && (!g_dxgiCtx.initialized || forceGdiRendersCursor))
-			{
-				sentHideCursor = 1;
-				char tmpBuffer[5];
-				((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
-				((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
-				tmpBuffer[4] = (char)KVM_MouseCursor_NONE;														// Cursor Type
-				writeHandler(tmpBuffer, 5, reserved);
-			}
-			if (forceGdiRendersCursor && g_dxgiCtx.initialized)
-			{
-				restoreDxgiCursorAfterGdi = 1;
-			}
-		}
-		else
-		{
-			if (sentHideCursor != 0)
-			{
-				sentHideCursor = 0;
-				char tmpBuffer[5];
-				((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR); // Write the type
-				((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);					// Write the size
-				tmpBuffer[4] = (char)gCurrentCursor;															// Cursor Type
-				writeHandler(tmpBuffer, 5, reserved);
-			}
+			kvm_set_client_cursor_visible(writeHandler, reserved, &sentHideCursor, !(mouseMove[0] != 0 && SCALING_FACTOR == 1024));
 		}
 
 		// Scan the desktop
@@ -1241,9 +1260,15 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			}
 			else if (captureResult == 1) // DXGI Error/Lost
 			{
-				// Fallback to GDI immediately
+				/* Cursor ownership follows the backend that actually produced this
+				   frame, including a late DXGI-to-GDI fallback. */
 				usedDxgiCapture = 0;
 				captureResult = get_desktop_buffer(&desktop, &desktopsize, mouseMove);
+				if (captureResult == 0) kvm_set_client_cursor_visible(writeHandler, reserved, &sentHideCursor, !(mouseMove[0] != 0 && SCALING_FACTOR == 1024));
+			}
+			else
+			{
+				kvm_set_client_cursor_visible(writeHandler, reserved, &sentHideCursor, g_dxgiCtx.clientCursorVisible);
 			}
 		}
 		else
@@ -1363,17 +1388,6 @@ DWORD WINAPI kvm_server_mainloop_ex(LPVOID parm)
 			/* Consume exactly one refresh. New refreshes remain pending for their
 		   own full GDI frame. */
 			InterlockedDecrement(&g_kvmRefreshPending);
-		}
-		if (restoreDxgiCursorAfterGdi)
-		{
-			/* The forced GDI frame contains the cursor. Restore the DXGI client
-		   cursor afterwards so an idle DXGI desktop does not leave it hidden. */
-			sentHideCursor = 0;
-			char tmpBuffer[5];
-			((unsigned short *)tmpBuffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_MOUSE_CURSOR);
-			((unsigned short *)tmpBuffer)[1] = (unsigned short)htons((unsigned short)5);
-			tmpBuffer[4] = (char)gCurrentCursor;
-			writeHandler(tmpBuffer, 5, reserved);
 		}
 
 		KVMDEBUG("kvm_server_mainloop / loop3", (int)GetCurrentThreadId());
@@ -1707,6 +1721,14 @@ void kvm_dxgi_cleanup()
 	g_dxgiCtx.initialized = 0;
 	g_dxgiCtx.screenSelection = -1;
 	g_dxgiCtx.monitor = NULL;
+	if (g_dxgiCtx.pointerShapeBuffer) { free(g_dxgiCtx.pointerShapeBuffer); g_dxgiCtx.pointerShapeBuffer = NULL; }
+	g_dxgiCtx.pointerShapeBufferCapacity = 0;
+	g_dxgiCtx.pointerShapeBufferSize = 0;
+	g_dxgiCtx.pointerShapeValid = 0;
+	g_dxgiCtx.pointerStateKnown = 0;
+	g_dxgiCtx.pointerVisible = 0;
+	g_dxgiCtx.previousPointerRectValid = 0;
+	g_dxgiCtx.clientCursorVisible = 1;
 	g_D3D11CreateDevice = NULL;
 	g_CreateDXGIFactory1 = NULL;
 
@@ -1841,6 +1863,7 @@ int kvm_dxgi_init()
 	g_dxgiCtx.initialized = 1;
 	g_dxgiCtx.screenSelection = screenSelection;
 	g_dxgiCtx.monitor = outputDesc.Monitor;
+	g_dxgiCtx.clientCursorVisible = 1;
 	return 1;
 }
 
@@ -1872,6 +1895,174 @@ static int kvm_dxgi_mark_rect_tiles(char* tileFlags, long long left, long long t
 	return 1;
 }
 
+static void kvm_dxgi_mark_clipped_rect_tiles(char* tileFlags, const RECT* rect)
+{
+	long long left, top, right, bottom;
+	if (tileFlags == NULL || rect == NULL) return;
+	left = rect->left < 0 ? 0 : rect->left;
+	top = rect->top < 0 ? 0 : rect->top;
+	right = rect->right > SCREEN_WIDTH ? SCREEN_WIDTH : rect->right;
+	bottom = rect->bottom > SCREEN_HEIGHT ? SCREEN_HEIGHT : rect->bottom;
+	if (left < right && top < bottom) kvm_dxgi_mark_rect_tiles(tileFlags, left, top, right, bottom);
+}
+
+static int kvm_dxgi_release_frame()
+{
+	HRESULT hr = g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication);
+	if (FAILED(hr))
+	{
+		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: ReleaseFrame failed (0x%08x)", hr);
+		kvm_dxgi_cleanup();
+		return 0;
+	}
+	return 1;
+}
+
+static int kvm_dxgi_update_pointer(const DXGI_OUTDUPL_FRAME_INFO* frameInfo)
+{
+	HRESULT hr;
+	UINT requiredSize = 0;
+	BYTE* newBuffer;
+	if (frameInfo->LastMouseUpdateTime.QuadPart != 0)
+	{
+		g_dxgiCtx.pointerPosition = frameInfo->PointerPosition.Position;
+		g_dxgiCtx.pointerVisible = frameInfo->PointerPosition.Visible != 0;
+		g_dxgiCtx.pointerStateKnown = 1;
+	}
+	if (frameInfo->PointerShapeBufferSize == 0) return 1;
+	if (frameInfo->PointerShapeBufferSize > g_dxgiCtx.pointerShapeBufferCapacity)
+	{
+		newBuffer = (BYTE*)realloc(g_dxgiCtx.pointerShapeBuffer, frameInfo->PointerShapeBufferSize);
+		if (newBuffer == NULL)
+		{
+			g_dxgiCtx.pointerShapeBufferSize = 0;
+			g_dxgiCtx.pointerShapeValid = 0;
+			return 0;
+		}
+		g_dxgiCtx.pointerShapeBuffer = newBuffer;
+		g_dxgiCtx.pointerShapeBufferCapacity = frameInfo->PointerShapeBufferSize;
+	}
+	hr = g_dxgiCtx.duplication->lpVtbl->GetFramePointerShape(g_dxgiCtx.duplication, g_dxgiCtx.pointerShapeBufferCapacity, g_dxgiCtx.pointerShapeBuffer, &requiredSize, &g_dxgiCtx.pointerShapeInfo);
+	if (FAILED(hr) || requiredSize == 0 || requiredSize > g_dxgiCtx.pointerShapeBufferCapacity)
+	{
+		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: GetFramePointerShape failed (0x%08x)", hr);
+		g_dxgiCtx.pointerShapeBufferSize = 0;
+		g_dxgiCtx.pointerShapeValid = 0;
+		return 0;
+	}
+	g_dxgiCtx.pointerShapeBufferSize = requiredSize;
+	g_dxgiCtx.pointerShapeValid = 1;
+	return 1;
+}
+
+static int kvm_dxgi_compose_pointer(BYTE* desktop, int adjWidth, int adjHeight, char* tileFlags)
+{
+	DXGI_OUTDUPL_POINTER_SHAPE_INFO* info = &g_dxgiCtx.pointerShapeInfo;
+	UINT shapeHeight = info->Height;
+	UINT minPitch;
+	size_t requiredSize;
+	RECT currentRect;
+	int x, y;
+	if (g_dxgiCtx.previousPointerRectValid)
+	{
+		kvm_dxgi_mark_clipped_rect_tiles(tileFlags, &g_dxgiCtx.previousPointerRect);
+		g_dxgiCtx.previousPointerRectValid = 0;
+	}
+	if (!g_dxgiCtx.pointerStateKnown)
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	if (!g_dxgiCtx.pointerVisible || !g_dxgiCtx.pointerShapeValid)
+	{
+		g_dxgiCtx.clientCursorVisible = g_dxgiCtx.pointerVisible ? 1 : 0;
+		return 0;
+	}
+	if (info->Width == 0 || info->Height == 0 || info->Width > 32768 || info->Height > 65536)
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	if (info->Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME)
+	{
+		if ((shapeHeight & 1) != 0) { g_dxgiCtx.clientCursorVisible = 1; return 0; }
+		shapeHeight /= 2;
+		minPitch = (info->Width + 7) / 8;
+	}
+	else if (info->Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR || info->Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR)
+	{
+		if (info->Width > (((UINT)~0) / 4)) { g_dxgiCtx.clientCursorVisible = 1; return 0; }
+		minPitch = info->Width * 4;
+	}
+	else
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	if (shapeHeight == 0 || info->Pitch == 0 || info->Pitch < minPitch || info->Height > (((size_t)-1) / info->Pitch))
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	requiredSize = (size_t)info->Pitch * (size_t)info->Height;
+	if (requiredSize > g_dxgiCtx.pointerShapeBufferSize)
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	if (g_dxgiCtx.pointerPosition.x < -(LONG)info->Width || g_dxgiCtx.pointerPosition.x > SCREEN_WIDTH ||
+		g_dxgiCtx.pointerPosition.y < -(LONG)shapeHeight || g_dxgiCtx.pointerPosition.y > SCREEN_HEIGHT)
+	{
+		g_dxgiCtx.clientCursorVisible = 1;
+		return 0;
+	}
+	currentRect.left = g_dxgiCtx.pointerPosition.x;
+	currentRect.top = g_dxgiCtx.pointerPosition.y;
+	currentRect.right = currentRect.left + (LONG)info->Width;
+	currentRect.bottom = currentRect.top + (LONG)shapeHeight;
+	kvm_dxgi_mark_clipped_rect_tiles(tileFlags, &currentRect);
+	for (y = 0; y < (int)shapeHeight; y++)
+	{
+		int dstY = currentRect.top + y;
+		if (dstY < 0 || dstY >= SCREEN_HEIGHT) continue;
+		for (x = 0; x < (int)info->Width; x++)
+		{
+			int dstX = currentRect.left + x;
+			BYTE* dst;
+			if (dstX < 0 || dstX >= SCREEN_WIDTH) continue;
+			dst = desktop + (((size_t)(adjHeight - 1 - dstY) * (size_t)adjWidth + (size_t)dstX) * 4);
+			if (info->Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME)
+			{
+				BYTE mask = (BYTE)(0x80 >> (x & 7));
+				BYTE andBit = g_dxgiCtx.pointerShapeBuffer[((size_t)y * info->Pitch) + (x / 8)] & mask;
+				BYTE xorBit = g_dxgiCtx.pointerShapeBuffer[((size_t)(y + shapeHeight) * info->Pitch) + (x / 8)] & mask;
+				int channel;
+				for (channel = 0; channel < 3; channel++) dst[channel] = (BYTE)((dst[channel] & (andBit ? 0xFF : 0x00)) ^ (xorBit ? 0xFF : 0x00));
+			}
+			else
+			{
+				BYTE* src = g_dxgiCtx.pointerShapeBuffer + ((size_t)y * info->Pitch) + ((size_t)x * 4);
+				if (info->Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR)
+				{
+					if (src[3] == 0xFF) { dst[0] ^= src[0]; dst[1] ^= src[1]; dst[2] ^= src[2]; }
+					else { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; }
+				}
+				else
+				{
+					UINT inverseAlpha = 255 - src[3];
+					dst[0] = (BYTE)(((src[0] * src[3]) + (dst[0] * inverseAlpha) + 127) / 255);
+					dst[1] = (BYTE)(((src[1] * src[3]) + (dst[1] * inverseAlpha) + 127) / 255);
+					dst[2] = (BYTE)(((src[2] * src[3]) + (dst[2] * inverseAlpha) + 127) / 255);
+				}
+			}
+		}
+	}
+	g_dxgiCtx.previousPointerRect = currentRect;
+	g_dxgiCtx.previousPointerRectValid = 1;
+	g_dxgiCtx.clientCursorVisible = 0;
+	return 1;
+}
+
 int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMove)
 {
 	HRESULT hr;
@@ -1886,6 +2077,8 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	int metadataValid = 0;
 	int metadataRectCount = 0;
 	int i, row, col;
+	long long requiredBufferSize;
+	UNREFERENCED_PARAMETER(mouseMove);
 	*buffer = NULL;
 	*bufferSize = 0;
 	if (!g_dxgiCtx.initialized) return 1;
@@ -1911,10 +2104,17 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		return 1;
 	}
 	if (FAILED(hr)) { kvm_dxgi_cleanup(); return 1; }
+	if (!kvm_dxgi_update_pointer(&frameInfo))
+	{
+		desktopResource->lpVtbl->Release(desktopResource);
+		kvm_dxgi_release_frame();
+		kvm_dxgi_cleanup();
+		return 1;
+	}
 
 	hr = desktopResource->lpVtbl->QueryInterface(desktopResource, &IID_ID3D11Texture2D, (void**)&desktopImage);
 	desktopResource->lpVtbl->Release(desktopResource);
-	if (FAILED(hr)) { g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication); return 1; }
+	if (FAILED(hr)) { kvm_dxgi_release_frame(); return 1; }
 
 	/* Validate the driver-provided surface before CopyResource. Rotated output
 	   surfaces must use the unrotated dimensions described by Microsoft. */
@@ -1927,10 +2127,11 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		expectedSurfaceWidth = g_dxgiCtx.desc.ModeDesc.Height;
 		expectedSurfaceHeight = g_dxgiCtx.desc.ModeDesc.Width;
 	}
-	if (desktopDesc.Width != expectedSurfaceWidth || desktopDesc.Height != expectedSurfaceHeight || desktopDesc.Format != g_dxgiCtx.desc.ModeDesc.Format)
+	if (desktopDesc.Width != expectedSurfaceWidth || desktopDesc.Height != expectedSurfaceHeight ||
+		desktopDesc.Format != g_dxgiCtx.desc.ModeDesc.Format || desktopDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
 	{
 		desktopImage->lpVtbl->Release(desktopImage);
-		g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication);
+		kvm_dxgi_release_frame();
 		kvm_dxgi_cleanup();
 		return 1;
 	}
@@ -2023,8 +2224,12 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		}
 	}
 
-	// Release the acquired frame now that metadata has been read
-	g_dxgiCtx.duplication->lpVtbl->ReleaseFrame(g_dxgiCtx.duplication);
+	// Release the acquired frame now that its resource and metadata are no longer used.
+	if (!kvm_dxgi_release_frame())
+	{
+		if (metadataTileFlags != NULL) free(metadataTileFlags);
+		return 1;
+	}
 
 	if (g_dxgiCtx.desc.ModeDesc.Width != (UINT)SCREEN_WIDTH || g_dxgiCtx.desc.ModeDesc.Height != (UINT)SCREEN_HEIGHT)
 	{
@@ -2037,6 +2242,8 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	if (FAILED(hr))
 	{
 		if (metadataTileFlags != NULL) free(metadataTileFlags);
+		ILibRemoteLogging_printf(gKVMRemoteLogging, ILibRemoteLogging_Modules_Agent_KVM, ILibRemoteLogging_Flags_VerbosityLevel_1, "DXGI: Map failed (0x%08x), recreating duplication", hr);
+		kvm_dxgi_cleanup();
 		return 1;
 	}
 
@@ -2057,16 +2264,25 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		srcWidth = dstHeight;
 		srcHeight = dstWidth;
 	}
-	UINT dstRowPitch = adjWidth * 4;
-
-	*bufferSize = (long long)adjWidth * (long long)adjHeight * 4;
+	requiredBufferSize = (long long)adjWidth * (long long)adjHeight * 4;
+	if (adjWidth <= 0 || adjHeight <= 0 || adjWidth > (int)(((UINT)~0) / 4) || srcWidth > (((UINT)~0) / 4) || mappedResource.pData == NULL ||
+		(mappedResource.RowPitch % 4) != 0 || mappedResource.RowPitch < srcWidth * 4 || requiredBufferSize <= 0 ||
+		(unsigned long long)requiredBufferSize > (unsigned long long)((size_t)-1))
+	{
+		g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
+		if (metadataTileFlags != NULL) free(metadataTileFlags);
+		kvm_dxgi_cleanup();
+		return 1;
+	}
+	UINT dstRowPitch = (UINT)adjWidth * 4;
 	PIXEL_SIZE = 4;
 	/* Reuse a persistent buffer across frames to avoid malloc/free (~8 MB) per capture.
 	   Only reallocate when the required size changes (resolution change). */
-	if (g_dxgiDesktopBufSize != *bufferSize)
+	if (g_dxgiDesktopBufSize != requiredBufferSize)
 	{
 		free(g_dxgiDesktopBuf);
-		g_dxgiDesktopBuf = malloc((size_t)*bufferSize);
+		g_dxgiDesktopBuf = NULL;
+		g_dxgiDesktopBuf = malloc((size_t)requiredBufferSize);
 		if (g_dxgiDesktopBuf == NULL)
 		{
 			g_dxgiDesktopBufSize = 0;
@@ -2077,17 +2293,16 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		/* Zero only on first allocation — the flipped row copy below overwrites
 		   all visible pixels; only tile-alignment padding remains untouched
 		   and stale padding data is harmless for CRC and JPEG encoding. */
-		memset(g_dxgiDesktopBuf, 0, (size_t)*bufferSize);
-		g_dxgiDesktopBufSize = *bufferSize;
+		memset(g_dxgiDesktopBuf, 0, (size_t)requiredBufferSize);
+		g_dxgiDesktopBufSize = requiredBufferSize;
 	}
-	*buffer = g_dxgiDesktopBuf;
 
 	// DXGI produces a top-down, physically unrotated surface. Convert it to the
 	// logical display orientation while preserving tile.cpp's bottom-up DIB.
 	UINT x, y;
 	UINT srcPitchPixels = mappedResource.RowPitch / 4;
 	UINT* srcPixels = (UINT*)mappedResource.pData;
-	BYTE* dstBase = (BYTE*)*buffer;
+	BYTE* dstBase = (BYTE*)g_dxgiDesktopBuf;
 	for (y = 0; y < dstHeight; y++)
 	{
 		// Keep the visible desktop at the top of the aligned bottom-up DIB.
@@ -2113,6 +2328,7 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 	}
 
 	g_dxgiCtx.context->lpVtbl->Unmap(g_dxgiCtx.context, (ID3D11Resource*)g_dxgiCtx.stagingTexture, 0);
+	kvm_dxgi_compose_pointer((BYTE*)g_dxgiDesktopBuf, adjWidth, adjHeight, metadataTileFlags);
 	if (metadataTileFlags != NULL)
 	{
 		for (row = 0; row < TILE_HEIGHT_COUNT; row++)
@@ -2125,6 +2341,8 @@ int get_desktop_buffer_dxgi(void **buffer, long long *bufferSize, long* mouseMov
 		free(metadataTileFlags);
 	}
 
+	*buffer = g_dxgiDesktopBuf;
+	*bufferSize = requiredBufferSize;
 	return 0;
 }
 
